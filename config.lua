@@ -197,16 +197,16 @@ Config.Shops = {
         },
         ped = {
             model = 's_m_m_dockwork_01',
-            coords = vector4(-794.68, -1510.83, 1.60, 292.25)
+            coords = vector4(-832.46, -1411.32, 1.61, 289.61)
         },
         targetLabel = 'Browse Boats',
         targetIcon = 'ship',
         categories = {
             'boats'
         },
-        dealership = vector3(-794.68, -1510.83, 1.60),
-        testDrive = vector4(-807.55, -1496.16, 0.12, 111.11),
-        spawn = vector4(-807.55, -1496.16, 0.12, 111.11),
+        dealership = vector3(-831.57, -1412.9, 1.61),
+        testDrive = vector4(-834.69, -1418.18, 1.74, 199.18),
+        spawn = vector4(-812.95, -1424.88, 1.83, 173.8),
         garage = Config.DefaultGarages.boat,
         blip = {
             enabled = true,

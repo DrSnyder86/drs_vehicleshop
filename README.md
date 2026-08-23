@@ -251,6 +251,25 @@ AI approximations for sale inventory because they can misrepresent the actual ad
 model. Neither the custom model packs nor `screenshot-basic` are included in this
 workspace.
 
+## UI previewer
+
+The `preview` directory contains a zero-dependency browser previewer for UI development.
+It loads the real production NUI in an exact-size iframe, supplies car/boat/air fixtures,
+and mocks quote, purchase, test-drive, close, and dealer callbacks entirely in memory.
+It includes controls for checkout and error states, responsive viewport presets,
+test-drive timers, simulated game backdrops, live CSS overrides, and callback inspection.
+
+From the resource folder, run:
+
+```powershell
+node preview/server.mjs
+```
+
+Then open `http://127.0.0.1:4173/preview/`. No npm install or build step is required.
+The preview files are deliberately absent from `fxmanifest.lua`, so FiveM never loads or
+ships the developer harness. See `preview/README.md` for the full control and isolation
+notes.
+
 ## Restart behavior
 
 DRS Vehicle Shop journals every in-progress delivery. On startup it restores interrupted owned
