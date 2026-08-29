@@ -72,6 +72,11 @@ it fails delivery closed when neither compatible garage is available and safely 
 the purchase stored. Use `ensure lunar_garage` in the start order only for the legacy
 resource.
 
+`drs_vehicleshop` also exposes `ResolveVehiclePresentation` on the client. Companion
+resources can use it to obtain the configured vehicle name, brand, and ordered image
+candidates without copying this resource's vehicle artwork. The export is presentation
+only and does not grant access to purchase or ownership actions.
+
 ## Database
 
 Database setup is automatic. On startup, the resource waits for oxmysql and then:

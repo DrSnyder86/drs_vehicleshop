@@ -535,6 +535,10 @@ local function BuildCheckoutPlateStyleOptions(settings, enabled)
             id = id,
             label = configured.label:sub(1, 64),
             preview = type(configured.preview) == 'string' and configured.preview:sub(1, 64) or configured.label:sub(1, 64),
+            image = type(configured.image) == 'string'
+                and (configured.image:match('^assets/plates/[%w_-]+%.png$')
+                    or configured.image:match('^assets/plates/[%w_-]+%.webp$'))
+                or nil,
             index = index,
             price = price
         }
@@ -722,7 +726,7 @@ local function ResolveCheckout(vehicle, category, shop, resolvedShopId, model, c
     local publicStyles = {}
     for _, option in ipairs(plateStyles) do
         publicStyles[#publicStyles + 1] = {
-            id = option.id, label = option.label, preview = option.preview, price = option.price
+            id = option.id, label = option.label, preview = option.preview, image = option.image, price = option.price
         }
     end
 

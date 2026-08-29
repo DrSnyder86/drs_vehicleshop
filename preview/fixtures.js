@@ -15,10 +15,11 @@
   ];
 
   const plateStyles = [
-    { id: "blue_white", label: "Blue / White", preview: "San Andreas", price: 0 },
-    { id: "yellow_black", label: "Yellow / Black", preview: "San Andreas", price: 1000 },
-    { id: "yellow_blue", label: "Yellow / Blue", preview: "San Andreas", price: 1000 },
-    { id: "white_blue", label: "White / Blue", preview: "San Andreas", price: 1000 },
+    { id: "blue_white", label: "San Andreas Cursive", image: "assets/plates/san-andreas-cursive.png", price: 0 },
+    { id: "yellow_black", label: "San Andreas Black", image: "assets/plates/san-andreas-black.png", price: 1000 },
+    { id: "yellow_blue", label: "San Andreas Blue", image: "assets/plates/san-andreas-blue.png", price: 1000 },
+    { id: "white_blue", label: "San Andreas Plain", image: "assets/plates/san-andreas-plain.png", price: 1000 },
+    { id: "sa_exempt", label: "SA Exempt", image: "assets/plates/sa-exempt.png", price: 1000 },
   ];
 
   const deliveryModes = [
@@ -207,6 +208,7 @@
           defaultCategory: "sports",
           categoryOrder: ["sports", "suvs", "classics"],
           presentation: {
+            image: "assets/shops/auto.webp",
             logo: "assets/shops/pdm.svg",
             eyebrow: "Premium Deluxe Motorsport",
             title: "Choose a vehicle to begin",
@@ -265,6 +267,7 @@
           defaultCategory: "boats",
           categoryOrder: ["boats", "personal_watercraft"],
           presentation: {
+            image: "assets/shops/boat.webp",
             logo: "assets/shops/pds.svg",
             eyebrow: "Puerto Del Sol Marina",
             title: "Choose a vessel to begin",
@@ -325,6 +328,7 @@
           defaultCategory: "helicopters",
           categoryOrder: ["helicopters", "planes"],
           presentation: {
+            image: "assets/shops/air.webp",
             logo: "assets/shops/lsa.svg",
             eyebrow: "Los Santos Air Sales",
             title: "Choose an aircraft to begin",

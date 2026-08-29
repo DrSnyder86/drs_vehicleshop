@@ -119,8 +119,139 @@ local function GetShop(shopId)
     return GetLegacyShop(), 'default'
 end
 
+local vehiclePresentationByModel
+local vehiclePresentationByHash
+
+local function CleanVehiclePresentationModel(value)
+    if type(value) ~= 'string' then return end
+
+    local model = value:match('^%s*([%w_-]+)%s*$')
+    if not model or #model > 64 then return end
+
+    return model:lower()
+end
+
+local function CleanVehiclePresentationText(value, maxLength)
+    if type(value) ~= 'string' and type(value) ~= 'number' then return end
+
+    local text = tostring(value):gsub('[%z\1-\31\127]', '')
+    if #text > (maxLength or 96) then text = text:sub(1, maxLength or 96) end
+
+    return text ~= '' and text or nil
+end
+
+local function CleanVehiclePresentationImage(value)
+    if type(value) ~= 'string' or #value > 128 then return end
+
+    local filename = value:match('([^/\\]+)$')
+    if not filename or not filename:match('^[%w_.-]+$') then return end
+
+    local extension = filename:match('%.([%w]+)$')
+    if not extension then
+        filename = filename .. '.webp'
+        extension = 'webp'
+    end
+
+    extension = extension:lower()
+    if extension ~= 'webp' and extension ~= 'png' then return end
+
+    return filename
+end
+
+local function NormalizeVehiclePresentationHash(value)
+    local hash = tonumber(value)
+    if not hash then return end
+
+    return math.floor(hash) % 4294967296
+end
+
+local function BuildVehiclePresentationIndex()
+    if vehiclePresentationByModel then return end
+
+    vehiclePresentationByModel = {}
+    vehiclePresentationByHash = {}
+    local resourceName = GetCurrentResourceName()
+
+    for _, categoryVehicles in pairs(type(Config.Vehicles) == 'table' and Config.Vehicles or {}) do
+        for vehicleKey, vehicle in pairs(type(categoryVehicles) == 'table' and categoryVehicles or {}) do
+            if type(vehicle) == 'table' then
+                local model = CleanVehiclePresentationModel(vehicle.model or vehicleKey)
+
+                if model then
+                    local candidates, seen = {}, {}
+                    local function AddCandidate(url)
+                        if not url or seen[url] then return end
+
+                        seen[url] = true
+                        candidates[#candidates + 1] = url
+                    end
+                    local function AddLocalImage(filename)
+                        filename = CleanVehiclePresentationImage(filename)
+                        if filename then
+                            AddCandidate(('https://cfx-nui-%s/html/assets/vehicles/%s'):format(resourceName, filename))
+                        end
+                    end
+
+                    AddLocalImage(vehicle.image)
+
+                    if vehicle.isAddon == true then
+                        AddLocalImage(model .. '.webp')
+                        AddCandidate(('https://docs.fivem.net/vehicles/%s.webp'):format(model))
+                    else
+                        AddCandidate(('https://docs.fivem.net/vehicles/%s.webp'):format(model))
+                        AddLocalImage(model .. '.webp')
+                    end
+
+                    local presentation = {
+                        model = model,
+                        name = CleanVehiclePresentationText(vehicle.name, 96),
+                        brand = CleanVehiclePresentationText(vehicle.brand, 48),
+                        isAddon = vehicle.isAddon == true,
+                        candidates = candidates
+                    }
+
+                    vehiclePresentationByModel[model] = presentation
+
+                    local hashFunction = joaat or GetHashKey
+                    local ok, hash = pcall(hashFunction, model)
+                    hash = ok and NormalizeVehiclePresentationHash(hash) or nil
+                    if hash then vehiclePresentationByHash[hash] = presentation end
+                end
+            end
+        end
+    end
+end
+
+local function ResolveVehiclePresentation(value)
+    BuildVehiclePresentationIndex()
+
+    local presentation
+    if type(value) == 'number' then
+        presentation = vehiclePresentationByHash[NormalizeVehiclePresentationHash(value)]
+    else
+        local model = CleanVehiclePresentationModel(value)
+        presentation = model and vehiclePresentationByModel[model] or nil
+    end
+
+    if not presentation then return end
+
+    local candidates = {}
+    for i = 1, #presentation.candidates do candidates[i] = presentation.candidates[i] end
+
+    return {
+        model = presentation.model,
+        name = presentation.name,
+        brand = presentation.brand,
+        isAddon = presentation.isAddon,
+        candidates = candidates
+    }
+end
+
+exports('ResolveVehiclePresentation', ResolveVehiclePresentation)
+
 local shopPresentationDefaults = {
     auto = {
+        image = 'assets/shops/auto.webp',
         logo = 'assets/shops/pdm.svg',
         eyebrow = 'Vehicle showroom',
         title = 'Choose a vehicle to begin',
@@ -132,6 +263,7 @@ local shopPresentationDefaults = {
         }
     },
     boat = {
+        image = 'assets/shops/boat.webp',
         logo = 'assets/shops/pds.svg',
         eyebrow = 'Marina sales',
         title = 'Choose a vessel to begin',
@@ -143,6 +275,7 @@ local shopPresentationDefaults = {
         }
     },
     air = {
+        image = 'assets/shops/air.webp',
         logo = 'assets/shops/lsa.svg',
         eyebrow = 'Aircraft sales',
         title = 'Choose an aircraft to begin',
@@ -203,7 +336,14 @@ local function BuildShopPresentation(shop, shopId)
         logo = defaults.logo
     end
 
+    local image = CleanPresentationText(configured.image, defaults.image, 96)
+
+    if not image:match('^assets/shops/[%w_-]+%.webp$') then
+        image = defaults.image
+    end
+
     return {
+        image = image,
         logo = logo,
         eyebrow = CleanPresentationText(configured.eyebrow, defaults.eyebrow, 48),
         title = CleanPresentationText(configured.title, defaults.title, 72),
@@ -221,6 +361,13 @@ local function CleanCheckoutId(value, maximumLength)
     end
 
     return value
+end
+
+local function CleanCheckoutPlateImage(value)
+    if type(value) ~= 'string' or #value > 96 then return nil end
+
+    return value:match('^assets/plates/[%w_-]+%.png$')
+        or value:match('^assets/plates/[%w_-]+%.webp$')
 end
 
 local function BuildCheckoutOptionList(configuredOptions, optionType, maximumOptions)
@@ -249,6 +396,7 @@ local function BuildCheckoutOptionList(configuredOptions, optionType, maximumOpt
                     if swatch then option.swatch = swatch:upper() end
                 elseif optionType == 'plateStyle' then
                     option.preview = CleanPresentationText(configuredOption.preview, option.label, 48)
+                    option.image = CleanCheckoutPlateImage(configuredOption.image)
                 elseif optionType == 'delivery' then
                     option.description = CleanPresentationText(configuredOption.description, '', 128)
                 end

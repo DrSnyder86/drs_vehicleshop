@@ -199,7 +199,7 @@ html[data-drs-preview-background="checker"] body {
         secondaryColor: optionLabel(checkout.colors, selection.secondaryColorId, "Included"),
         plate: selection.plateMode === "prefix" ? `${selection.platePrefix || "DRS"} prefix` : "Standard issue",
         plateMode: selection.plateMode === "prefix" ? "Custom prefix" : "Standard issue",
-        plateStyle: optionLabel(checkout.plateStyles, selection.plateStyleId, "Blue / White"),
+        plateStyle: optionLabel(checkout.plateStyles, selection.plateStyleId, "San Andreas Cursive"),
         deliveryMode: optionLabel(checkout.deliveryModes, selection.deliveryMode, "Drive away"),
       },
       costs: { base, paint, plate, style, total: base + paint + plate + style },
@@ -643,7 +643,7 @@ html[data-drs-preview-background="checker"] body {
     if (!/^https?:$/.test(window.location.protocol)) return;
     const child = elements.frame.contentWindow;
     const doc = elements.frame.contentDocument;
-    if (!child || !doc || state.initializedDocument === doc) return;
+    if (!child || !doc?.head || state.initializedDocument === doc) return;
 
     state.initializedDocument = doc;
     // Build the fetch shim inside the iframe's own JavaScript realm. This keeps

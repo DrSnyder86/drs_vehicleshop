@@ -111,10 +111,11 @@ Config.Checkout = {
         blocked = { 'PD', 'EMS', 'FIB', 'GOV', 'LEO' }
     },
     plateStyles = {
-        { id = 'blue_white',  label = 'Blue / White',  preview = 'San Andreas', index = 0, price = 0 },
-        { id = 'yellow_black',label = 'Yellow / Black',preview = 'San Andreas', index = 1, price = 1000 },
-        { id = 'yellow_blue', label = 'Yellow / Blue', preview = 'San Andreas', index = 2, price = 1000 },
-        { id = 'white_blue',  label = 'White / Blue',  preview = 'San Andreas', index = 3, price = 1000 }
+        { id = 'blue_white',   label = 'San Andreas Cursive', image = 'assets/plates/san-andreas-cursive.png', index = 0, price = 0 },
+        { id = 'yellow_black', label = 'San Andreas Black',   image = 'assets/plates/san-andreas-black.png',   index = 1, price = 1000 },
+        { id = 'yellow_blue',  label = 'San Andreas Blue',    image = 'assets/plates/san-andreas-blue.png',    index = 2, price = 1000 },
+        { id = 'white_blue',   label = 'San Andreas Plain',   image = 'assets/plates/san-andreas-plain.png',   index = 3, price = 1000 },
+        { id = 'sa_exempt',    label = 'SA Exempt',           image = 'assets/plates/sa-exempt.png',           index = 4, price = 1000 }
     },
     deliveryModes = {
         { id = 'driveaway', label = 'Drive away', description = 'Take delivery at the dealership.', price = 0 },
@@ -137,6 +138,7 @@ Config.Shops = {
         type = 'car',
         defaultCategory = 'sports',        -- initial catalogue category; validated client-side against this shop's inventory
         presentation = {
+            image = 'assets/shops/auto.webp',
             logo = 'assets/shops/pdm.svg',
             eyebrow = 'Premium Deluxe Motorsport',
             title = 'Choose a vehicle to begin',
@@ -185,6 +187,7 @@ Config.Shops = {
         type = 'boat',
         defaultCategory = 'boats',
         presentation = {
+            image = 'assets/shops/boat.webp',
             logo = 'assets/shops/pds.svg',
             eyebrow = 'Puerto Del Sol Marina',
             title = 'Choose a vessel to begin',
@@ -220,6 +223,7 @@ Config.Shops = {
         type = 'air',
         defaultCategory = 'helicopters',
         presentation = {
+            image = 'assets/shops/air.webp',
             logo = 'assets/shops/lsa.svg',
             eyebrow = 'Los Santos Air Sales',
             title = 'Choose an aircraft to begin',

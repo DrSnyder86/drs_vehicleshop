@@ -27,6 +27,7 @@ const imageProbeCache = new Map();
 const imageLoadTokens = new WeakMap();
 const checkoutIdPattern = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const safeSwatchPattern = /^#[0-9A-Fa-f]{3}(?:[0-9A-Fa-f]{3})?$/;
+const safePlateArtworkPattern = /^assets\/plates\/[A-Za-z0-9_-]+\.(?:png|webp)$/;
 const featuredColorLimit = 5;
 const featuredColorIds = Object.freeze([
   "black",
@@ -41,7 +42,11 @@ const defaultCheckoutConfig = Object.freeze({
     { id: "graphite", label: "Graphite", swatch: "#27282d" },
   ],
   plateStyles: [
-    { id: "blue_white", label: "Blue / White", preview: "San Andreas" },
+    {
+      id: "blue_white",
+      label: "San Andreas Cursive",
+      image: "assets/plates/san-andreas-cursive.png",
+    },
   ],
   deliveryModes: [
     {
@@ -67,6 +72,7 @@ const defaultCheckoutConfig = Object.freeze({
 });
 const defaultShopPresentations = {
   car: {
+    image: "assets/shops/auto.webp",
     logo: "assets/shops/pdm.svg",
     eyebrow: "Premium Deluxe Motorsport",
     title: "Choose a vehicle to begin",
@@ -88,6 +94,7 @@ const defaultShopPresentations = {
     ],
   },
   boat: {
+    image: "assets/shops/boat.webp",
     logo: "assets/shops/pds.svg",
     eyebrow: "Puerto Del Sol Marina",
     title: "Choose a vessel to begin",
@@ -109,6 +116,7 @@ const defaultShopPresentations = {
     ],
   },
   air: {
+    image: "assets/shops/air.webp",
     logo: "assets/shops/lsa.svg",
     eyebrow: "Los Santos Air Sales",
     title: "Choose an aircraft to begin",
@@ -197,6 +205,10 @@ function normalizedShopPresentation(value, shop) {
   const logo = /^assets\/shops\/[A-Za-z0-9_-]+\.(?:svg|webp)$/.test(requestedLogo)
     ? requestedLogo
     : fallback.logo;
+  const requestedImage = asText(raw.image).trim();
+  const image = /^assets\/shops\/[A-Za-z0-9_-]+\.webp$/.test(requestedImage)
+    ? requestedImage
+    : fallback.image;
   const rawDetails = Array.isArray(raw.details) ? raw.details : [];
   const details = fallback.details.map((fallbackDetail, index) => {
     const detail = asObject(rawDetails[index]);
@@ -207,6 +219,7 @@ function normalizedShopPresentation(value, shop) {
   });
 
   return {
+    image,
     logo,
     eyebrow: presentationText(raw.eyebrow, fallback.eyebrow, 48),
     title: presentationText(raw.title, fallback.title, 72),
@@ -248,6 +261,8 @@ function normalizedCheckoutOptions(value, type, fallback, maxItems) {
         : "#74777c";
     } else if (type === "plate") {
       option.preview = checkoutText(raw.preview, option.label, 32);
+      const artwork = asText(raw.image).trim();
+      if (safePlateArtworkPattern.test(artwork)) option.image = artwork;
     } else if (type === "delivery") {
       option.description = checkoutText(
         raw.description,
@@ -1279,23 +1294,34 @@ function renderVehicleInfoEmpty() {
   hero.className = "detail-empty-hero";
 
   const image = document.createElement("img");
-  image.src = presentation.logo;
   image.alt = `${presentation.eyebrow} showroom`;
   image.decoding = "async";
   image.draggable = false;
 
-  const fallbackLogo = defaultShopPresentations[shopTypeKey(activeShop)].logo;
-  let attemptedFallback = presentation.logo === fallbackLogo;
+  const fallbackPresentation =
+    defaultShopPresentations[shopTypeKey(activeShop)];
+  const imageCandidates = [
+    presentation.image,
+    fallbackPresentation.image,
+    presentation.logo,
+    fallbackPresentation.logo,
+  ].filter(
+    (candidate, index, candidates) =>
+      candidate && candidates.indexOf(candidate) === index,
+  );
+  let imageCandidateIndex = 0;
   image.addEventListener("error", () => {
-    if (!attemptedFallback) {
-      attemptedFallback = true;
-      image.src = fallbackLogo;
+    imageCandidateIndex += 1;
+
+    if (imageCandidates[imageCandidateIndex]) {
+      image.src = imageCandidates[imageCandidateIndex];
       return;
     }
 
     hero.classList.add("is-missing");
     image.remove();
   });
+  image.src = imageCandidates[imageCandidateIndex];
 
   const status = document.createElement("span");
   status.className = "shop-hero-status";
@@ -1476,19 +1502,50 @@ function checkoutPlatePreviewText() {
   return "PENDING";
 }
 
-function updateLicensePlate(plate, number, styleId) {
-  const safeStyleId = safeCheckoutId(styleId) || "blue_white";
-  const safeNumber = checkoutText(number, "PENDING", 16).toLocaleUpperCase();
-  plate.dataset.plateStyle = safeStyleId;
-  plate.classList.toggle("is-compact", safeNumber.length > 8);
-  plate.querySelector(".checkout-license-plate-number").textContent = safeNumber;
-  plate.setAttribute("aria-label", `San Andreas registration plate: ${safeNumber}`);
+function checkoutPlateStyle(styleId, options = checkoutConfig?.plateStyles) {
+  const available = Array.isArray(options) ? options : [];
+  const safeStyleId = safeCheckoutId(styleId);
+  return available.find((option) => option.id === safeStyleId) || available[0] || null;
 }
 
-function createLicensePlate(number, styleId, className = "") {
+function updateLicensePlate(plate, number, styleId, options = checkoutConfig?.plateStyles) {
+  const style = checkoutPlateStyle(styleId, options);
+  const safeStyleId = style?.id || safeCheckoutId(styleId) || "blue_white";
+  const safeNumber = checkoutText(number, "PENDING", 16).toLocaleUpperCase();
+  const artwork = plate.querySelector(".checkout-license-plate-artwork");
+  const image = style?.image && safePlateArtworkPattern.test(style.image)
+    ? style.image
+    : "";
+
+  plate.dataset.plateStyle = safeStyleId;
+  plate.dataset.hasArtwork = String(Boolean(image));
+  plate.classList.toggle("is-compact", safeNumber.length > 8);
+  if (artwork) {
+    artwork.hidden = !image;
+    if (image && artwork.getAttribute("src") !== image) artwork.src = image;
+    if (!image) artwork.removeAttribute("src");
+  }
+  plate.querySelector(".checkout-license-plate-number").textContent = safeNumber;
+  plate.setAttribute(
+    "aria-label",
+    `${style?.label || "San Andreas"} registration plate: ${safeNumber}`,
+  );
+}
+
+function createLicensePlate(
+  number,
+  styleId,
+  className = "",
+  options = checkoutConfig?.plateStyles,
+) {
   const plate = document.createElement("span");
   plate.className = `checkout-license-plate${className ? ` ${className}` : ""}`;
 
+  const artwork = document.createElement("img");
+  artwork.className = "checkout-license-plate-artwork";
+  artwork.alt = "";
+  artwork.decoding = "async";
+  artwork.draggable = false;
   const jurisdiction = document.createElement("span");
   jurisdiction.className = "checkout-license-plate-jurisdiction";
   jurisdiction.textContent = "San Andreas";
@@ -1498,9 +1555,91 @@ function createLicensePlate(number, styleId, className = "") {
   region.className = "checkout-license-plate-region";
   region.textContent = "Los Santos • Blaine County";
 
-  plate.append(jurisdiction, registration, region);
-  updateLicensePlate(plate, number, styleId);
+  plate.append(artwork, jurisdiction, registration, region);
+  updateLicensePlate(plate, number, styleId, options);
   return plate;
+}
+
+function createPlateStyleCarousel(options, getPlateNumber) {
+  const available = Array.isArray(options) ? options : [];
+  const carousel = document.createElement("div");
+  carousel.className = "checkout-plate-carousel";
+  carousel.setAttribute("role", "group");
+  carousel.setAttribute("aria-roledescription", "carousel");
+  carousel.setAttribute("aria-label", "Plate style");
+
+  const stage = document.createElement("div");
+  stage.className = "checkout-plate-carousel-stage";
+  const previous = document.createElement("button");
+  previous.type = "button";
+  previous.className = "checkout-plate-carousel-previous";
+  previous.setAttribute("aria-label", "Previous plate style");
+  previous.title = "Previous plate style";
+  previous.textContent = "‹";
+  const plate = createLicensePlate(
+    getPlateNumber(),
+    checkoutDraft.plateStyleId,
+    "",
+    available,
+  );
+  plate.setAttribute("aria-hidden", "true");
+  const next = document.createElement("button");
+  next.type = "button";
+  next.className = "checkout-plate-carousel-next";
+  next.setAttribute("aria-label", "Next plate style");
+  next.title = "Next plate style";
+  next.textContent = "›";
+  stage.append(previous, plate, next);
+
+  const status = document.createElement("div");
+  status.className = "checkout-plate-carousel-status";
+  status.setAttribute("aria-live", "polite");
+  status.setAttribute("aria-atomic", "true");
+  const label = document.createElement("strong");
+  const position = document.createElement("span");
+  status.append(label, position);
+  carousel.append(stage, status);
+
+  const selectedIndex = () => {
+    const index = available.findIndex(
+      (option) => option.id === checkoutDraft.plateStyleId,
+    );
+    return index >= 0 ? index : 0;
+  };
+  const refresh = () => {
+    const index = selectedIndex();
+    const option = available[index];
+    if (!option) return;
+
+    checkoutDraft.plateStyleId = option.id;
+    updateLicensePlate(plate, getPlateNumber(), option.id, available);
+    label.textContent = option.label;
+    position.textContent = `${index + 1} of ${available.length}`;
+    carousel.setAttribute(
+      "aria-label",
+      `Plate style: ${option.label}, ${index + 1} of ${available.length}`,
+    );
+  };
+  const move = (offset) => {
+    if (available.length < 2) return;
+    const index = (selectedIndex() + offset + available.length) % available.length;
+    checkoutDraft.plateStyleId = available[index].id;
+    checkoutSelectionChanged();
+    refresh();
+  };
+
+  previous.disabled = available.length < 2;
+  next.disabled = available.length < 2;
+  previous.addEventListener("click", () => move(-1));
+  next.addEventListener("click", () => move(1));
+  carousel.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    move(event.key === "ArrowLeft" ? -1 : 1);
+  });
+  refresh();
+
+  return { element: carousel, refresh };
 }
 
 function createColorPicker(title, field, options) {
@@ -1707,31 +1846,41 @@ function renderCheckoutConfigure(vehicle) {
       "Registration",
       "Your final plate remains unique and is issued by the dealership.",
     );
-    const registrationPreview = document.createElement("div");
-    registrationPreview.className = "checkout-registration-preview";
-    registrationPreview.setAttribute("role", "img");
-    const livePlate = createLicensePlate(
-      checkoutPlatePreviewText(),
-      checkoutDraft.plateStyleId,
-    );
-    livePlate.setAttribute("aria-hidden", "true");
-    const registrationPreviewLabel = document.createElement("span");
-    registrationPreviewLabel.textContent = "San Andreas registration preview";
-    registrationPreview.append(livePlate, registrationPreviewLabel);
-    registration.append(registrationPreview);
-
-    const refreshRegistrationPreview = () => {
-      const previewText = checkoutPlatePreviewText();
-      updateLicensePlate(
-        livePlate,
-        previewText,
+    let refreshRegistrationPreview;
+    if (config.capabilities.plateStyles) {
+      const plateCarousel = createPlateStyleCarousel(
+        config.plateStyles,
+        checkoutPlatePreviewText,
+      );
+      refreshRegistrationPreview = plateCarousel.refresh;
+      registration.append(plateCarousel.element);
+    } else {
+      const registrationPreview = document.createElement("div");
+      registrationPreview.className = "checkout-registration-preview";
+      registrationPreview.setAttribute("role", "img");
+      const livePlate = createLicensePlate(
+        checkoutPlatePreviewText(),
         checkoutDraft.plateStyleId,
       );
-      registrationPreview.setAttribute(
-        "aria-label",
-        `San Andreas registration preview: ${previewText}`,
-      );
-    };
+      livePlate.setAttribute("aria-hidden", "true");
+      const registrationPreviewLabel = document.createElement("span");
+      registrationPreviewLabel.textContent = "San Andreas registration preview";
+      registrationPreview.append(livePlate, registrationPreviewLabel);
+      registration.append(registrationPreview);
+
+      refreshRegistrationPreview = () => {
+        const previewText = checkoutPlatePreviewText();
+        updateLicensePlate(
+          livePlate,
+          previewText,
+          checkoutDraft.plateStyleId,
+        );
+        registrationPreview.setAttribute(
+          "aria-label",
+          `San Andreas registration preview: ${previewText}`,
+        );
+      };
+    }
     refreshRegistrationPreview();
 
     if (config.capabilities.platePrefix) {
@@ -1790,17 +1939,6 @@ function renderCheckoutConfigure(vehicle) {
       registration.append(prefixField);
     }
 
-    if (config.capabilities.plateStyles) {
-      registration.append(
-        createChoiceGroup({
-          label: "Plate style",
-          field: "plateStyleId",
-          className: "checkout-style-choices",
-          options: config.plateStyles,
-          onChange: refreshRegistrationPreview,
-        }),
-      );
-    }
     scroll.append(registration);
   }
 
@@ -2059,6 +2197,8 @@ function renderCheckoutReview(vehicle) {
   const plate = createLicensePlate(
     quote.platePreview,
     quote.selection.plateStyleId,
+    "",
+    quote.options.plateStyles,
   );
   plate.setAttribute("aria-hidden", "true");
   const plateCaption = document.createElement("span");
