@@ -130,6 +130,45 @@ Config.Checkout = {
     }
 }
 
+-- Server-only society fleet checkout. The public UI never receives authority
+-- to choose a price, plate, ownership row, or job. DRS Garages calls the
+-- protected server exports with the acting boss and a durable request id; this
+-- resource resolves the catalogue price and debits the configured society
+-- account before asking DRS Garages to create the stored job vehicle.
+Config.Fleet = {
+    Enabled = true,
+    GarageResource = 'drs_garages',
+    AllowedCallers = {
+        drs_garages = true
+    },
+    -- `auto` prefers qb-banking because its mutation export returns an awaited
+    -- affected-row result. Renewed-Banking remains supported, but its current
+    -- export acknowledges before its asynchronous database write is confirmed.
+    BankProvider = 'auto',                -- auto, renewed-banking, qb-banking, none
+    RequireOnDuty = true,
+    MinimumBossGrade = 0,
+    PurchaseCooldown = 2500,
+    MaxCatalogResults = 300,
+
+    -- Fleet access is deliberately allowlisted per exact framework job. A rule
+    -- may contain `models`, `categories`, or both; they are combined. Prices
+    -- always come from Config.Vehicles. Add-on police/EMS models must be listed
+    -- here (or enabled through an intentionally broader category rule).
+    Catalogs = {
+        police = {
+            account = 'police',
+            models = {
+                'pbus', 'police', 'police2', 'police3', 'police4', 'policeb',
+                'policet', 'pranger', 'riot', 'sheriff', 'sheriff2'
+            }
+        },
+        ambulance = {
+            account = 'ambulance',
+            models = { 'ambulance', 'firetruk', 'lguard' }
+        }
+    }
+}
+
 Config.DefaultShop = 'auto'
 
 Config.Shops = {
@@ -169,7 +208,8 @@ Config.Shops = {
             'trucks',
             'vans',
             'drift',
-            'luxury'
+            'luxury',
+            'emergency'
         },
         dealership = Config.DealershipCoords,
         testDrive = Config.TestDriveCoords,
@@ -257,10 +297,10 @@ Config.Shops = {
     }
 }
 
--- Optional server-enforced access rules. Add a category to a shop before exposing
--- it, then define its allowed Qbox/QB groups and minimum grades here.
+-- Server-enforced category authorization. Shop categories control visibility;
+-- these exact Qbox/QB group names and minimum grades protect transactions.
 Config.CategoryAccess = {
-    -- emergency = { groups = { police = 0, ambulance = 0 } },
+    emergency = { groups = { police = 0 } },
     -- service = { groups = { mechanic = 0, taxi = 0 } }
 }
 

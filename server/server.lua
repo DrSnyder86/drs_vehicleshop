@@ -21,6 +21,12 @@ local CheckoutQuotes = {}
 local CheckoutQuoteBySource = {}
 local CheckoutQuoteCooldowns = {}
 local DeliveryAcknowledgements = {}
+local FleetServiceReady = false
+local FleetOrdersReady = false
+local FleetRequestOperations = {}
+local FleetJobOperations = {}
+local FleetPurchaseCooldowns = {}
+local FleetRefundProcessing = {}
 
 local REQUIRED_VEHICLE_COLUMNS = {
     'id', 'license', 'citizenid', 'vehicle', 'hash', 'mods', 'plate',
@@ -460,6 +466,328 @@ local function NormalizeConfiguredPrice(value)
     value = tonumber(value or 0)
     if not value or value < 0 or value % 1 ~= 0 or value > 4294967295 then return nil end
     return value
+end
+
+local function GetFleetConfig()
+    return type(Config.Fleet) == 'table' and Config.Fleet or {}
+end
+
+local function CleanFleetName(value, maximum)
+    if type(value) ~= 'string' then return nil end
+    value = value:lower():match('^%s*(.-)%s*$')
+    if value == '' or #value > maximum or not value:match('^[%w_%-]+$') then return nil end
+    return value
+end
+
+local function CleanFleetRequestId(value)
+    if type(value) ~= 'string' or #value < 8 or #value > 64 then return nil end
+    if not value:match('^[%w_%.:%-]+$') then return nil end
+    return value
+end
+
+local function CleanFleetReason(value)
+    if value == nil then return nil end
+    if type(value) ~= 'string' then return nil end
+    value = value:gsub('[%z\1-\31\127]', ''):match('^%s*(.-)%s*$')
+    if value == '' then return nil end
+    return value:sub(1, 160)
+end
+
+local function FleetInteger(value, minimum, maximum)
+    value = tonumber(value)
+    if not value or value ~= value or value == math.huge or value == -math.huge
+        or value % 1 ~= 0 or value < minimum or value > maximum then
+        return nil
+    end
+    return math.floor(value)
+end
+
+local function FleetCollectionContains(collection, needle)
+    if type(collection) ~= 'table' then return false end
+    if collection[needle] == true then return true end
+    for key, value in pairs(collection) do
+        if type(key) == 'number' and tostring(value):lower() == needle then return true end
+    end
+    return false
+end
+
+local function GetFleetCatalogRule(job)
+    local catalogs = GetFleetConfig().Catalogs
+    local rule = type(catalogs) == 'table' and catalogs[job] or nil
+    if type(rule) ~= 'table' or rule.enabled == false then return nil end
+    if not next(type(rule.models) == 'table' and rule.models or {})
+        and not next(type(rule.categories) == 'table' and rule.categories or {}) then
+        return nil
+    end
+    return rule
+end
+
+local function FleetRuleAllows(rule, model, category)
+    if FleetCollectionContains(rule.denyModels, model) then return false end
+    return FleetCollectionContains(rule.models, model)
+        or FleetCollectionContains(rule.categories, tostring(category or ''):lower())
+end
+
+local function ResolveFleetCatalogVehicle(job, model)
+    local rule = GetFleetCatalogRule(job)
+    if not rule then return nil, 'fleet_job_not_configured' end
+    if not VehicleCatalog then BuildVehicleCatalog() end
+
+    local selected
+    for _, entry in ipairs(VehicleCatalog[model] or {}) do
+        if FleetRuleAllows(rule, model, entry.category) then
+            local price = NormalizeConfiguredPrice(entry.vehicle and entry.vehicle.price)
+            if not price then return nil, 'fleet_price_invalid' end
+            local candidate = {
+                vehicle = entry.vehicle,
+                category = entry.category,
+                model = model,
+                price = price,
+                vehicleType = GetVehicleGarageType(entry.vehicle, entry.category, nil)
+            }
+            if selected and (selected.price ~= candidate.price
+                or selected.vehicleType ~= candidate.vehicleType
+                or selected.category ~= candidate.category) then
+                return nil, 'fleet_catalog_ambiguous'
+            end
+            selected = candidate
+        end
+    end
+
+    if not selected then return nil, 'fleet_vehicle_not_allowed' end
+    return selected, nil, rule
+end
+
+local function BuildFleetCatalog(job)
+    local rule = GetFleetCatalogRule(job)
+    if not rule then return nil, 'fleet_job_not_configured' end
+    if not VehicleCatalog then BuildVehicleCatalog() end
+
+    local models = {}
+    for model in pairs(VehicleCatalog) do models[#models + 1] = model end
+    table.sort(models)
+
+    local maximum = math.max(1, math.min(1000, math.floor(tonumber(GetFleetConfig().MaxCatalogResults) or 300)))
+    local output = {}
+    for _, model in ipairs(models) do
+        local resolved = ResolveFleetCatalogVehicle(job, model)
+        if resolved then
+            local vehicle = resolved.vehicle
+            output[#output + 1] = {
+                model = resolved.model,
+                name = tostring(vehicle.name or resolved.model):sub(1, 96),
+                brand = tostring(vehicle.brand or ''):sub(1, 64),
+                category = tostring(resolved.category or ''):sub(1, 64),
+                vehicleType = resolved.vehicleType,
+                price = resolved.price,
+                image = type(vehicle.image) == 'string' and vehicle.image:sub(1, 128) or nil
+            }
+            if #output >= maximum then break end
+        end
+    end
+
+    table.sort(output, function(left, right)
+        local leftName = tostring(left.name or left.model):lower()
+        local rightName = tostring(right.name or right.model):lower()
+        if leftName == rightName then return left.model < right.model end
+        return leftName < rightName
+    end)
+    return output, nil, rule
+end
+
+local function GetFleetJobGrade(job)
+    if type(job) ~= 'table' then return 0 end
+    local grade = job.grade
+    if type(grade) == 'table' then grade = grade.level or grade.grade end
+    return tonumber(grade) or 0
+end
+
+local function ValidateFleetBoss(src, requestedJob, minimumGrade)
+    if GetFramework() ~= 'qbox' then
+        return nil, 'fleet_framework_unsupported', 'Paid society fleet purchases currently require Qbox.'
+    end
+
+    local data = GetPlayerData(src)
+    if not data then return nil, 'player_unavailable', 'The acting player is no longer available.' end
+    local job = data.job
+    local currentJob = type(job) == 'table' and CleanFleetName(job.name, 50) or nil
+    if not currentJob or currentJob ~= requestedJob then
+        return nil, 'fleet_job_changed', 'Your current job no longer matches this fleet.'
+    end
+    if job.isboss ~= true then
+        return nil, 'fleet_boss_required', 'Only the current job boss can purchase society vehicles.'
+    end
+
+    local configuredMinimum = math.max(0, math.floor(tonumber(GetFleetConfig().MinimumBossGrade) or 0))
+    minimumGrade = math.max(configuredMinimum, math.max(0, math.floor(tonumber(minimumGrade) or 0)))
+    if GetFleetJobGrade(job) < minimumGrade then
+        return nil, 'fleet_grade_required', 'Your job grade is not high enough for this fleet purchase.'
+    end
+    if GetFleetConfig().RequireOnDuty ~= false and job.onduty ~= true and job.onDuty ~= true then
+        return nil, 'fleet_duty_required', 'You must be on duty to purchase a society vehicle.'
+    end
+    return data
+end
+
+local function ResolveFleetBankProvider(configured)
+    configured = tostring(configured or GetFleetConfig().BankProvider or 'auto'):lower()
+    if configured == 'none' then return nil end
+    if configured == 'auto' then
+        if GetResourceState('qb-banking') == 'started' then return 'qb-banking' end
+        if GetResourceState('Renewed-Banking') == 'started' then return 'renewed-banking' end
+        return nil
+    end
+    if configured == 'renewed-banking' and GetResourceState('Renewed-Banking') == 'started' then
+        return configured
+    end
+    if configured == 'qb-banking' and GetResourceState('qb-banking') == 'started' then
+        return configured
+    end
+end
+
+local function GetSocietyBalance(provider, account)
+    local ok, balance
+    if provider == 'renewed-banking' then
+        ok, balance = pcall(function()
+            return exports['Renewed-Banking']:getAccountMoney(account)
+        end)
+    elseif provider == 'qb-banking' then
+        ok, balance = pcall(function()
+            return exports['qb-banking']:GetAccountBalance(account)
+        end)
+    else
+        return nil, 'unsupported_provider'
+    end
+    balance = ok and tonumber(balance) or nil
+    if not ok or not balance then return nil, tostring(balance or 'balance_unavailable') end
+    return balance
+end
+
+-- Returns true only for a confirmed mutation, false for a confirmed rejection,
+-- and nil when the provider response is ambiguous and staff review is required.
+-- Renewed Banking documents boolean results. QB Banking returns oxmysql's
+-- affected-row count, although true is also accepted for compatible forks.
+local function ClassifySocietyMutation(provider, result)
+    if result == true then return true end
+    if result == false then return false, 'provider_rejected' end
+    if provider == 'qb-banking' and type(result) == 'number'
+        and result == result and result ~= math.huge and result ~= -math.huge and result > 0
+    then
+        return true
+    end
+    return nil, 'provider_response_unconfirmed'
+end
+
+local function RemoveSocietyFunds(provider, account, amount, reason)
+    if amount == 0 then return true end
+    local ok, removed
+    if provider == 'renewed-banking' then
+        ok, removed = pcall(function()
+            return exports['Renewed-Banking']:removeAccountMoney(account, amount, reason)
+        end)
+    elseif provider == 'qb-banking' then
+        ok, removed = pcall(function()
+            return exports['qb-banking']:RemoveMoney(account, amount, reason)
+        end)
+    else
+        return false, 'unsupported_provider'
+    end
+    if not ok then return nil, tostring(removed) end
+    return ClassifySocietyMutation(provider, removed)
+end
+
+local function AddSocietyFunds(provider, account, amount, reason)
+    if amount == 0 then return true end
+    local ok, added
+    if provider == 'renewed-banking' then
+        ok, added = pcall(function()
+            return exports['Renewed-Banking']:addAccountMoney(account, amount, reason)
+        end)
+    elseif provider == 'qb-banking' then
+        ok, added = pcall(function()
+            return exports['qb-banking']:AddMoney(account, amount, reason)
+        end)
+    else
+        return false, 'unsupported_provider'
+    end
+    if not ok then return nil, tostring(added) end
+    return ClassifySocietyMutation(provider, added)
+end
+
+local function GetFleetGarageResource()
+    local resource = CleanFleetName(GetFleetConfig().GarageResource or 'drs_garages', 64)
+    return resource or 'drs_garages'
+end
+
+local function FleetRuntimeReady(requireBank)
+    local fleet = GetFleetConfig()
+    if fleet.Enabled ~= true then return false, 'fleet_disabled', 'Society fleet checkout is disabled.' end
+    if not FleetServiceReady then
+        return false, 'fleet_service_unavailable', 'Society fleet checkout is still starting or needs database attention.'
+    end
+    if GetFramework() ~= 'qbox' then
+        return false, 'fleet_framework_unsupported', 'Paid society fleet purchases currently require Qbox.'
+    end
+    local garageResource = GetFleetGarageResource()
+    if GetResourceState(garageResource) ~= 'started' then
+        return false, 'fleet_garage_unavailable', 'DRS Garages is not available for fleet creation.'
+    end
+    local statusCalled, garageStatus = pcall(function()
+        return exports[garageResource]:GetJobFleetServiceStatus()
+    end)
+    if not statusCalled or type(garageStatus) ~= 'table'
+        or garageStatus.ok ~= true or garageStatus.ready ~= true then
+        return false, 'fleet_garage_unavailable',
+            type(garageStatus) == 'table' and tostring(garageStatus.message or 'DRS Garages fleet service is not ready.')
+                or 'DRS Garages does not provide a ready fleet-creation service.'
+    end
+    local provider = ResolveFleetBankProvider()
+    if requireBank and not provider then
+        return false, 'fleet_bank_unavailable', 'No supported society banking provider is available.'
+    end
+    return true, nil, nil, provider, garageResource
+end
+
+local function GetAuthorizedFleetCaller()
+    local caller = GetInvokingResource()
+    local allowed = GetFleetConfig().AllowedCallers
+    if type(caller) ~= 'string' or type(allowed) ~= 'table' or allowed[caller] ~= true then
+        return nil
+    end
+    return caller
+end
+
+local function NormalizeFleetPurchaseRequest(request)
+    if type(request) ~= 'table' then return nil, 'invalid_request' end
+    local allowedKeys = {
+        requestId = true, actorSource = true, action = true, job = true,
+        model = true, garageIndex = true, reason = true
+    }
+    for key in pairs(request) do
+        if not allowedKeys[key] then return nil, 'invalid_request_field' end
+    end
+    if request.action ~= nil and request.action ~= 'society_purchase' then
+        return nil, 'invalid_action'
+    end
+
+    local actorSource = FleetInteger(request.actorSource, 1, 2147483647)
+    local garageIndex = FleetInteger(request.garageIndex, 1, 100000)
+    local normalized = {
+        requestId = CleanFleetRequestId(request.requestId),
+        actorSource = actorSource,
+        job = CleanFleetName(request.job, 50),
+        model = CleanFleetName(request.model, 64),
+        garageIndex = garageIndex,
+        reason = CleanFleetReason(request.reason)
+    }
+    if not normalized.requestId or not normalized.actorSource or normalized.actorSource < 1
+        or not normalized.job or not normalized.model
+        or not normalized.garageIndex or normalized.garageIndex < 1
+        or normalized.garageIndex > 100000 then
+        return nil, 'invalid_request'
+    end
+    if request.reason ~= nil and type(request.reason) ~= 'string' then return nil, 'invalid_reason' end
+    return normalized
 end
 
 local function NormalizePlatePrefix(value, settings)
@@ -1649,6 +1977,128 @@ local function EnsureOrderTable()
     if not indexOk then return false end
 
     OrdersReady = true
+    return true
+end
+
+local function ValidateFleetOrderSchema(schema)
+    local checks = {
+        { 'id', { types = INTEGER_SCHEMA_TYPES, notNull = true, autoIncrement = true } },
+        { 'order_id', { types = STRING_SCHEMA_TYPES, minimumLength = 64, notNull = true } },
+        { 'request_id', { types = STRING_SCHEMA_TYPES, minimumLength = 96, notNull = true } },
+        { 'caller_resource', { types = STRING_SCHEMA_TYPES, minimumLength = 64, notNull = true } },
+        { 'actor_citizenid', { types = STRING_SCHEMA_TYPES, minimumLength = 50, notNull = true } },
+        { 'actor_license', { types = STRING_SCHEMA_TYPES, minimumLength = 80, insertOptional = true } },
+        { 'job', { types = STRING_SCHEMA_TYPES, minimumLength = 50, notNull = true } },
+        { 'model', { types = STRING_SCHEMA_TYPES, minimumLength = 64, notNull = true } },
+        { 'vehicle_type', { types = STRING_SCHEMA_TYPES, minimumLength = 20, notNull = true } },
+        { 'garage_index', { types = INTEGER_SCHEMA_TYPES, notNull = true } },
+        { 'minimum_grade', { types = INTEGER_SCHEMA_TYPES, notNull = true } },
+        { 'account', { types = STRING_SCHEMA_TYPES, minimumLength = 64, notNull = true } },
+        { 'bank_provider', { types = STRING_SCHEMA_TYPES, minimumLength = 32, notNull = true } },
+        { 'amount', { types = INTEGER_SCHEMA_TYPES, notNull = true } },
+        { 'purchase_reason', { types = STRING_SCHEMA_TYPES, minimumLength = 160, insertOptional = true } },
+        { 'status', { types = STRING_SCHEMA_TYPES, minimumLength = 32, notNull = true } },
+        { 'vehicle_id', { types = INTEGER_SCHEMA_TYPES, insertOptional = true } },
+        { 'plate', { types = STRING_SCHEMA_TYPES, minimumLength = 15, insertOptional = true } },
+        { 'garage_operation_id', { types = STRING_SCHEMA_TYPES, minimumLength = 96, insertOptional = true } },
+        { 'failure_reason', { types = { varchar = true, text = true }, minimumLength = 255, insertOptional = true } },
+        { 'created_at', { types = TIME_SCHEMA_TYPES, notNull = true, requiresDefault = true } },
+        { 'updated_at', { types = TIME_SCHEMA_TYPES, notNull = true, requiresDefault = true } }
+    }
+    for _, check in ipairs(checks) do
+        if not ValidateSchemaColumn('drs_vehicle_shop_fleet_orders', schema, check[1], check[2]) then return false end
+    end
+    return true
+end
+
+local function EnsureFleetOrderTable()
+    if FleetOrdersReady then return true end
+    local schema, inspectError = InspectTable('drs_vehicle_shop_fleet_orders')
+    if not schema then return SchemaFailure('inspecting the fleet-purchase journal', inspectError) end
+    if not schema.exists then
+        if not ExecuteSchemaChange('creating the fleet-purchase journal', [[
+            CREATE TABLE IF NOT EXISTS drs_vehicle_shop_fleet_orders (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            order_id VARCHAR(64) NOT NULL,
+            request_id VARCHAR(96) NOT NULL,
+            caller_resource VARCHAR(64) NOT NULL,
+            actor_citizenid VARCHAR(50) NOT NULL,
+            actor_license VARCHAR(80) NULL,
+            job VARCHAR(50) NOT NULL,
+            model VARCHAR(64) NOT NULL,
+            vehicle_type VARCHAR(20) NOT NULL,
+            garage_index INT UNSIGNED NOT NULL,
+            minimum_grade INT UNSIGNED NOT NULL DEFAULT 0,
+            account VARCHAR(64) NOT NULL,
+            bank_provider VARCHAR(32) NOT NULL,
+            amount INT UNSIGNED NOT NULL,
+            purchase_reason VARCHAR(160) NULL,
+            status VARCHAR(32) NOT NULL,
+            vehicle_id BIGINT NULL,
+            plate VARCHAR(15) NULL,
+            garage_operation_id VARCHAR(96) NULL,
+            failure_reason VARCHAR(255) NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        ]]) then return false end
+        schema, inspectError = InspectTable('drs_vehicle_shop_fleet_orders')
+    end
+    if not schema then return SchemaFailure('re-inspecting the fleet-purchase journal', inspectError) end
+    local historicalColumns = {
+        'id', 'order_id', 'request_id', 'caller_resource', 'actor_citizenid', 'actor_license',
+        'job', 'model', 'vehicle_type', 'garage_index', 'minimum_grade', 'account',
+        'bank_provider', 'amount', 'status', 'vehicle_id', 'plate', 'garage_operation_id',
+        'failure_reason', 'created_at', 'updated_at'
+    }
+    for _, column in ipairs(historicalColumns) do
+        if not schema.columns[column] then
+            return SchemaFailure('upgrading the fleet-purchase journal',
+                ('required historical column %s is missing; refusing to invent financial data'):format(column))
+        end
+    end
+    if not schema.columns.purchase_reason then
+        if not AddColumn('drs_vehicle_shop_fleet_orders', 'purchase_reason',
+            'VARCHAR(160) NULL AFTER `amount`') then return false end
+        schema, inspectError = InspectTable('drs_vehicle_shop_fleet_orders')
+        if not schema then return SchemaFailure('re-inspecting the fleet-purchase journal', inspectError) end
+    end
+    if not ValidateFleetOrderSchema(schema) then return false end
+
+    local engineOk, refreshed = EnsureInnoDB('drs_vehicle_shop_fleet_orders', schema)
+    if not engineOk then return false end
+    schema = refreshed or schema
+    local collationOk
+    collationOk, refreshed = EnsureTableTextCollation(
+        'drs_vehicle_shop_fleet_orders', schema, OwnershipTextCharset, OwnershipTextCollation
+    )
+    if not collationOk then return false end
+    schema = refreshed or schema
+    if not ValidateFleetOrderSchema(schema) then return false end
+
+    local indexOk
+    indexOk, refreshed = EnsureUniqueIndex('drs_vehicle_shop_fleet_orders', schema,
+        'uk_drs_vehicle_shop_fleet_order_id', 'order_id', 'fleet order id')
+    if not indexOk then return false end
+    schema = refreshed or schema
+    indexOk, refreshed = EnsureUniqueIndex('drs_vehicle_shop_fleet_orders', schema,
+        'uk_drs_vehicle_shop_fleet_request_id', 'request_id', 'fleet request id')
+    if not indexOk then return false end
+    schema = refreshed or schema
+    indexOk, refreshed = EnsureIndex('drs_vehicle_shop_fleet_orders', schema,
+        'idx_drs_vehicle_shop_fleet_job_status', { 'job', 'status' }, false)
+    if not indexOk then return false end
+    schema = refreshed or schema
+    indexOk, refreshed = EnsureIndex('drs_vehicle_shop_fleet_orders', schema,
+        'idx_drs_vehicle_shop_fleet_actor_status', { 'actor_citizenid', 'status' }, false)
+    if not indexOk then return false end
+    schema = refreshed or schema
+    indexOk = EnsureIndex('drs_vehicle_shop_fleet_orders', schema,
+        'idx_drs_vehicle_shop_fleet_plate', { 'plate' }, false)
+    if not indexOk then return false end
+
+    FleetOrdersReady = true
     return true
 end
 
@@ -3672,6 +4122,867 @@ local function StartTestDrive(src, model, shopId)
     return result
 end
 
+local FLEET_ORDER_FIELDS = [[
+    order_id, request_id, caller_resource, actor_citizenid, actor_license,
+    job, model, vehicle_type, garage_index, minimum_grade, account,
+    bank_provider, amount, purchase_reason, status, vehicle_id, plate, garage_operation_id,
+    failure_reason
+]]
+
+local function NewFleetOrderId(src)
+    SessionSequence = SessionSequence + 1
+    return ('fleet-%d-%d-%08x-%d'):format(
+        os.time(), src, math.random(0, 0x7fffffff), SessionSequence
+    )
+end
+
+local function GetFleetOrderByRequest(requestId)
+    local ok, row = pcall(MySQL.single.await, ([[
+        SELECT %s
+        FROM drs_vehicle_shop_fleet_orders
+        WHERE request_id = ?
+        LIMIT 1
+    ]]):format(FLEET_ORDER_FIELDS), { requestId })
+    if not ok then return nil, tostring(row) end
+    return row
+end
+
+local function GetFleetOrderById(orderId)
+    local ok, row = pcall(MySQL.single.await, ([[
+        SELECT %s
+        FROM drs_vehicle_shop_fleet_orders
+        WHERE order_id = ?
+        LIMIT 1
+    ]]):format(FLEET_ORDER_FIELDS), { orderId })
+    if not ok then return nil, tostring(row) end
+    return row
+end
+
+local function GetUnresolvedFleetOrder(job)
+    local ok, row = pcall(MySQL.single.await, [[
+        SELECT order_id, request_id, actor_citizenid, status, model
+        FROM drs_vehicle_shop_fleet_orders
+        WHERE job = ?
+          AND status NOT IN ('stored', 'refunded', 'cancelled', 'payment_failed')
+        ORDER BY id ASC
+        LIMIT 1
+    ]], { job })
+    if not ok then return nil, tostring(row) end
+    return row
+end
+
+local function CreateFleetOrder(caller, data, request, resolved, rule, provider, account)
+    local orderId = NewFleetOrderId(request.actorSource)
+    local minimumGrade = math.max(
+        math.max(0, math.floor(tonumber(GetFleetConfig().MinimumBossGrade) or 0)),
+        math.max(0, math.floor(tonumber(rule.minimumGrade) or 0))
+    )
+    local ok, inserted = pcall(MySQL.insert.await, [[
+        INSERT INTO drs_vehicle_shop_fleet_orders
+            (order_id, request_id, caller_resource, actor_citizenid, actor_license,
+             job, model, vehicle_type, garage_index, minimum_grade, account,
+             bank_provider, amount, purchase_reason, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+    ]], {
+        orderId, request.requestId, caller, data.citizenid, data.license,
+        request.job, request.model, resolved.vehicleType, request.garageIndex,
+        minimumGrade, account, provider, resolved.price, request.reason
+    })
+
+    if ok and inserted then
+        local row, readError = GetFleetOrderByRequest(request.requestId)
+        if row then return row end
+        return nil, readError or 'fleet_order_readback_failed'
+    end
+
+    local existing, readError = GetFleetOrderByRequest(request.requestId)
+    if existing then return existing, 'duplicate_request' end
+    return nil, readError or tostring(inserted or 'fleet_order_insert_failed')
+end
+
+local function UpdateFleetOrder(orderId, status, fields, expectedStatuses)
+    fields = fields or {}
+    local assignments = { 'status = ?' }
+    local parameters = { status }
+    if fields.vehicleId ~= nil then
+        assignments[#assignments + 1] = 'vehicle_id = ?'
+        parameters[#parameters + 1] = fields.vehicleId
+    end
+    if fields.plate ~= nil then
+        assignments[#assignments + 1] = 'plate = ?'
+        parameters[#parameters + 1] = fields.plate
+    end
+    if fields.garageOperationId ~= nil then
+        assignments[#assignments + 1] = 'garage_operation_id = ?'
+        parameters[#parameters + 1] = fields.garageOperationId
+    end
+    if fields.reason ~= nil then
+        fields.reason = tostring(fields.reason):sub(1, 255)
+        assignments[#assignments + 1] = 'failure_reason = ?'
+        parameters[#parameters + 1] = fields.reason
+    elseif fields.clearReason == true or status == 'stored' or status == 'refunded' then
+        assignments[#assignments + 1] = 'failure_reason = NULL'
+    end
+
+    parameters[#parameters + 1] = orderId
+    local where = 'order_id = ?'
+    if expectedStatuses ~= nil then
+        if type(expectedStatuses) ~= 'table' then expectedStatuses = { expectedStatuses } end
+        if #expectedStatuses < 1 then return false end
+        local placeholders = {}
+        for index, expected in ipairs(expectedStatuses) do
+            placeholders[index] = '?'
+            parameters[#parameters + 1] = expected
+        end
+        where = where .. (' AND status IN (%s)'):format(table.concat(placeholders, ', '))
+    end
+
+    local query = ('UPDATE drs_vehicle_shop_fleet_orders SET %s WHERE %s'):format(
+        table.concat(assignments, ', '), where
+    )
+    local ok, changed = pcall(MySQL.update.await, query, parameters)
+    if not ok then
+        print(('[drs_vehicleshop] Failed to update fleet order %s to %s: %s'):format(
+            tostring(orderId), tostring(status), tostring(changed)
+        ))
+        return false
+    end
+    if changed and changed > 0 then return true end
+
+    local row = GetFleetOrderById(orderId)
+    if not row or row.status ~= status then return false end
+    if fields.vehicleId ~= nil and tonumber(row.vehicle_id) ~= tonumber(fields.vehicleId) then return false end
+    if fields.plate ~= nil and NormalizePlate(row.plate) ~= NormalizePlate(fields.plate) then return false end
+    if fields.garageOperationId ~= nil
+        and tostring(row.garage_operation_id or '') ~= tostring(fields.garageOperationId) then return false end
+    if fields.reason ~= nil and tostring(row.failure_reason or '') ~= fields.reason then return false end
+    return true
+end
+
+local function FleetOrderMatchesRequest(order, caller, data, request)
+    if not order or order.request_id ~= request.requestId then return false end
+    if order.caller_resource ~= caller or order.actor_citizenid ~= data.citizenid then return false end
+    if tostring(order.job):lower() ~= request.job or tostring(order.model):lower() ~= request.model then return false end
+    if tonumber(order.garage_index) ~= request.garageIndex then return false end
+    return true
+end
+
+local function FleetCreationReviewIsRetryable(order)
+    if not order or order.status ~= 'creation_review' then return false end
+    local reason = tostring(order.failure_reason or '')
+    return reason:find('garage_result_unknown:', 1, true) == 1
+        or reason:find('garage_attention_retryable:', 1, true) == 1
+        or reason == 'restart_during_fleet_creation'
+        or reason == 'fleet_purchase_exception_during_creation'
+end
+
+local function FleetOrderResult(order, replayed)
+    if not order then
+        return Result(false, 'fleet_order_unavailable', 'The fleet order could not be read safely.')
+    end
+    local extra = {
+        orderId = order.order_id,
+        requestId = order.request_id,
+        operationId = order.garage_operation_id,
+        vehicleId = tonumber(order.vehicle_id),
+        plate = order.plate and NormalizePlate(order.plate) or nil,
+        job = order.job,
+        model = order.model,
+        amount = tonumber(order.amount) or 0,
+        status = order.status,
+        replayed = replayed == true
+    }
+    if order.status == 'stored' then
+        extra.committed = true
+        return Result(true, 'fleet_purchased', 'The society vehicle was purchased and stored in the job garage.', extra)
+    elseif order.status == 'refunded' then
+        return Result(false, 'fleet_purchase_refunded', 'The fleet purchase did not complete and the society account was refunded.', extra)
+    elseif order.status == 'payment_failed' then
+        return Result(false, 'fleet_payment_failed', 'The society payment was rejected.', extra)
+    elseif order.status == 'cancelled' then
+        return Result(false, 'fleet_purchase_cancelled', 'The fleet purchase was cancelled before payment.', extra)
+    elseif order.status == 'payment_review' then
+        extra.review = true
+        return Result(false, 'fleet_payment_review', 'The society debit result needs staff review before this job can purchase again.', extra)
+    elseif order.status == 'refund_review' then
+        extra.review = true
+        return Result(false, 'fleet_refund_review', 'The society refund result needs staff review.', extra)
+    elseif order.status == 'creation_review' then
+        extra.review = true
+        extra.retryable = FleetCreationReviewIsRetryable(order)
+        return Result(false, 'fleet_creation_review', 'Fleet creation is awaiting an idempotent retry or staff review.', extra)
+    end
+    extra.retryable = true
+    return Result(false, 'fleet_purchase_processing', 'The society fleet purchase is still being processed.', extra)
+end
+
+local function ProcessFleetRefund(order, reason)
+    if not order or not order.order_id then
+        return Result(false, 'fleet_refund_unavailable', 'The fleet refund record is unavailable.')
+    end
+    local orderId = order.order_id
+    if FleetRefundProcessing[orderId] then
+        return Result(false, 'fleet_refund_processing', 'The society refund is already being processed.', {
+            orderId = orderId, retryable = true
+        })
+    end
+
+    FleetRefundProcessing[orderId] = true
+    local ok, result = xpcall(function()
+        order = GetFleetOrderById(orderId)
+        if not order then return Result(false, 'fleet_refund_unavailable', 'The fleet refund record is unavailable.') end
+        if order.status == 'refunded' then return FleetOrderResult(order, true) end
+        if order.status ~= 'refund_due' then return FleetOrderResult(order, true) end
+        if not UpdateFleetOrder(order.order_id, 'refund_processing', {
+            reason = reason or order.failure_reason or 'fleet_creation_failed'
+        }, 'refund_due') then
+            return Result(false, 'fleet_refund_claim_failed', 'The society refund could not be claimed safely.', {
+                orderId = order.order_id, review = true
+            })
+        end
+
+        local provider = ResolveFleetBankProvider(order.bank_provider)
+        if not provider or provider ~= order.bank_provider then
+            UpdateFleetOrder(order.order_id, 'refund_due', { reason = 'refund_provider_unavailable' }, 'refund_processing')
+            return Result(false, 'fleet_bank_unavailable', 'The original society bank provider is unavailable for the refund.', {
+                orderId = order.order_id, retryable = true
+            })
+        end
+
+        local refunded, refundError = AddSocietyFunds(
+            provider,
+            order.account,
+            tonumber(order.amount) or 0,
+            ('drs-fleet-refund-%s'):format(order.order_id)
+        )
+        if refunded == true then
+            if UpdateFleetOrder(order.order_id, 'refunded', { clearReason = true }, 'refund_processing') then
+                local refreshed = GetFleetOrderById(order.order_id)
+                return FleetOrderResult(refreshed or order, true)
+            end
+            print(('[drs_vehicleshop] CRITICAL: society refund completed but fleet order %s could not be finalized.'):format(
+                tostring(order.order_id)
+            ))
+            UpdateFleetOrder(order.order_id, 'refund_review', {
+                reason = 'refund_confirmed_journal_finalize_failed'
+            }, 'refund_processing')
+            return Result(false, 'fleet_refund_review', 'The society refund completed but its journal needs staff review.', {
+                orderId = order.order_id, review = true
+            })
+        elseif refunded == false then
+            UpdateFleetOrder(order.order_id, 'refund_due', {
+                reason = ('refund_rejected:%s'):format(tostring(refundError or 'unknown'))
+            }, 'refund_processing')
+            return Result(false, 'fleet_refund_retry', 'The society refund was rejected and remains queued.', {
+                orderId = order.order_id, retryable = true
+            })
+        end
+
+        UpdateFleetOrder(order.order_id, 'refund_review', {
+            reason = ('refund_result_unknown:%s'):format(tostring(refundError or 'unknown'))
+        }, 'refund_processing')
+        return Result(false, 'fleet_refund_review', 'The society refund result is unknown and needs staff review.', {
+            orderId = order.order_id, review = true
+        })
+    end, debug.traceback)
+    FleetRefundProcessing[orderId] = nil
+    if not ok then
+        print(('[drs_vehicleshop] Fleet refund failed for order %s: %s'):format(
+            tostring(orderId), tostring(result)
+        ))
+        UpdateFleetOrder(orderId, 'refund_review', { reason = 'refund_exception' }, 'refund_processing')
+        return Result(false, 'fleet_refund_review', 'The society refund needs staff review after an internal error.', {
+            orderId = orderId, review = true
+        })
+    end
+    return result
+end
+
+local function ProcessDueFleetRefunds()
+    if not FleetOrdersReady then return true end
+    local refunds = MySQL.query.await(([[
+        SELECT %s
+        FROM drs_vehicle_shop_fleet_orders
+        WHERE status = 'refund_due'
+        ORDER BY id ASC
+        LIMIT 20
+    ]]):format(FLEET_ORDER_FIELDS)) or {}
+    for _, order in ipairs(refunds) do
+        local result = ProcessFleetRefund(order, order.failure_reason)
+        if not result.ok and result.review then
+            print(('[drs_vehicleshop] Fleet refund order %s needs staff review (%s).'):format(
+                tostring(order.order_id), tostring(result.code)
+            ))
+        end
+    end
+    return true
+end
+
+local function ProcessFleetCreation(order, actorSource)
+    order = order and GetFleetOrderById(order.order_id) or nil
+    if not order then return Result(false, 'fleet_order_unavailable', 'The fleet order could not be read safely.') end
+    if order.status == 'stored' then return FleetOrderResult(order, true) end
+    if order.status ~= 'debited' and order.status ~= 'creation_review' then
+        return FleetOrderResult(order, true)
+    end
+
+    local data, authCode, authMessage = ValidateFleetBoss(actorSource, order.job, order.minimum_grade)
+    if not data or data.citizenid ~= order.actor_citizenid then
+        if order.status == 'debited' and UpdateFleetOrder(order.order_id, 'refund_due', {
+            reason = authCode or 'actor_identity_changed_before_creation'
+        }, 'debited') then
+            return ProcessFleetRefund(GetFleetOrderById(order.order_id), authCode)
+        end
+        return Result(false, authCode or 'fleet_creation_review', authMessage or 'Fleet creation needs staff review.', {
+            orderId = order.order_id, review = order.status == 'creation_review'
+        })
+    end
+
+    local ready, runtimeCode, runtimeMessage, _, garageResource = FleetRuntimeReady(false)
+    if not ready then
+        return Result(false, runtimeCode, runtimeMessage, { orderId = order.order_id, retryable = true })
+    end
+    if not UpdateFleetOrder(order.order_id, 'creation_processing', {
+        reason = 'garage_creation_in_progress'
+    }, { 'debited', 'creation_review' }) then
+        local refreshed = GetFleetOrderById(order.order_id)
+        return FleetOrderResult(refreshed or order, true)
+    end
+
+    local called, garageResult = pcall(function()
+        return exports[garageResource]:CreateJobFleetVehicle({
+            requestId = order.request_id,
+            actorSource = actorSource,
+            action = 'society_purchase',
+            job = order.job,
+            model = order.model,
+            garageIndex = tonumber(order.garage_index),
+            minGrade = tonumber(order.minimum_grade) or 0,
+            reason = order.purchase_reason or ('Society purchase through DRS Vehicle Shop (%s)'):format(order.order_id)
+        })
+    end)
+
+    if not called or type(garageResult) ~= 'table' then
+        UpdateFleetOrder(order.order_id, 'creation_review', {
+            reason = ('garage_result_unknown:%s'):format(tostring(garageResult))
+        }, 'creation_processing')
+        return Result(false, 'fleet_creation_review', 'DRS Garages did not provide a conclusive creation result.', {
+            orderId = order.order_id, review = true, retryable = true
+        })
+    end
+
+    -- `committed` is authoritative even when DRS Garages also reports a journal
+    -- finalization warning through ok=false.
+    if garageResult.committed == true then
+        local vehicleId = tonumber(garageResult.vehicleId)
+        local plate = NormalizePlate(garageResult.plate)
+        local operationId = type(garageResult.operationId) == 'string'
+            and garageResult.operationId:sub(1, 96) or nil
+        if not vehicleId or vehicleId < 1 or not plate or plate == '' or not operationId then
+            UpdateFleetOrder(order.order_id, 'creation_review', {
+                reason = 'committed_garage_result_missing_identity'
+            }, 'creation_processing')
+            return Result(false, 'fleet_creation_review', 'The job vehicle exists but its shop journal needs staff review.', {
+                orderId = order.order_id, committed = true, review = true
+            })
+        end
+        if UpdateFleetOrder(order.order_id, 'stored', {
+            vehicleId = math.floor(vehicleId),
+            plate = plate,
+            garageOperationId = operationId,
+            clearReason = true
+        }, 'creation_processing') then
+            return FleetOrderResult(GetFleetOrderById(order.order_id) or order, false)
+        end
+        UpdateFleetOrder(order.order_id, 'creation_review', {
+            reason = 'committed_garage_result_journal_finalize_failed'
+        }, 'creation_processing')
+        return Result(false, 'fleet_creation_review', 'The job vehicle was created, but the shop journal needs staff review.', {
+            orderId = order.order_id, vehicleId = vehicleId, plate = plate,
+            operationId = operationId, committed = true, review = true
+        })
+    end
+
+    local garageCode = tostring(garageResult.code or 'garage_creation_failed'):sub(1, 96)
+    if garageResult.safeToRefund == true and garageResult.retryable == true then
+        UpdateFleetOrder(order.order_id, 'debited', {
+            reason = ('garage_retry:%s'):format(garageCode)
+        }, 'creation_processing')
+        return Result(false, 'fleet_creation_retry', garageResult.message or 'Fleet creation can be retried safely.', {
+            orderId = order.order_id, retryable = true
+        })
+    elseif garageResult.safeToRefund == true then
+        if UpdateFleetOrder(order.order_id, 'refund_due', {
+            reason = ('garage_safe_failure:%s'):format(garageCode)
+        }, 'creation_processing') then
+            return ProcessFleetRefund(GetFleetOrderById(order.order_id), garageCode)
+        end
+        return Result(false, 'fleet_refund_review', 'The safe creation failure could not be queued for refund.', {
+            orderId = order.order_id, review = true
+        })
+    end
+
+    UpdateFleetOrder(order.order_id, 'creation_review', {
+        reason = ('%s:%s'):format(
+            garageResult.retryable == true and 'garage_attention_retryable' or 'garage_attention',
+            garageCode
+        )
+    }, 'creation_processing')
+    return Result(false, 'fleet_creation_review', garageResult.message or 'Fleet creation needs staff review.', {
+        orderId = order.order_id,
+        operationId = garageResult.operationId,
+        vehicleId = tonumber(garageResult.vehicleId),
+        plate = garageResult.plate and NormalizePlate(garageResult.plate) or nil,
+        review = true,
+        retryable = garageResult.retryable == true
+    })
+end
+
+local function ProcessFleetPayment(order, actorSource)
+    order = order and GetFleetOrderById(order.order_id) or nil
+    if not order then return Result(false, 'fleet_order_unavailable', 'The fleet order could not be read safely.') end
+    if order.status ~= 'pending' then return FleetOrderResult(order, true) end
+
+    local runtimeReady, runtimeCode, runtimeMessage = FleetRuntimeReady(true)
+    if not runtimeReady then
+        return Result(false, runtimeCode, runtimeMessage, { orderId = order.order_id, retryable = true })
+    end
+
+    local data, authCode, authMessage = ValidateFleetBoss(actorSource, order.job, order.minimum_grade)
+    if not data or data.citizenid ~= order.actor_citizenid then
+        UpdateFleetOrder(order.order_id, 'cancelled', {
+            reason = authCode or 'actor_identity_changed_before_payment'
+        }, 'pending')
+        return Result(false, authCode or 'fleet_purchase_cancelled', authMessage or 'The acting player changed before payment.')
+    end
+
+    local provider = ResolveFleetBankProvider(order.bank_provider)
+    if not provider or provider ~= order.bank_provider then
+        return Result(false, 'fleet_bank_unavailable', 'The selected society bank provider is unavailable.', {
+            orderId = order.order_id, retryable = true
+        })
+    end
+    local balance = GetSocietyBalance(provider, order.account)
+    if balance == nil then
+        return Result(false, 'fleet_bank_unavailable', 'The society balance could not be verified.', {
+            orderId = order.order_id, retryable = true
+        })
+    end
+    if balance < (tonumber(order.amount) or 0) then
+        UpdateFleetOrder(order.order_id, 'payment_failed', { reason = 'insufficient_society_funds' }, 'pending')
+        return FleetOrderResult(GetFleetOrderById(order.order_id) or order, false)
+    end
+    if not UpdateFleetOrder(order.order_id, 'payment_processing', {
+        reason = 'society_debit_in_progress'
+    }, 'pending') then
+        return FleetOrderResult(GetFleetOrderById(order.order_id) or order, true)
+    end
+
+    data, authCode, authMessage = ValidateFleetBoss(actorSource, order.job, order.minimum_grade)
+    if not data or data.citizenid ~= order.actor_citizenid then
+        UpdateFleetOrder(order.order_id, 'cancelled', {
+            reason = authCode or 'actor_identity_changed_before_debit'
+        }, 'payment_processing')
+        return Result(false, authCode or 'fleet_purchase_cancelled', authMessage or 'The acting player changed before payment.')
+    end
+
+    -- QB Banking's society debit does not perform its own sufficient-funds
+    -- check. Re-read after claiming the order and completing final actor auth so
+    -- another withdrawal during those yields cannot turn this purchase negative.
+    local finalBalance, finalBalanceError = GetSocietyBalance(provider, order.account)
+    if finalBalance == nil then
+        local restored = UpdateFleetOrder(order.order_id, 'pending', {
+            reason = ('final_balance_unavailable:%s'):format(tostring(finalBalanceError or 'unknown'))
+        }, 'payment_processing')
+        if not restored then
+            UpdateFleetOrder(order.order_id, 'payment_review', {
+                reason = 'final_balance_unavailable_journal_restore_failed'
+            }, 'payment_processing')
+        end
+        return Result(false, restored and 'fleet_bank_unavailable' or 'fleet_payment_review',
+            restored and 'The society balance could not be rechecked; retry this order.'
+                or 'The payment journal needs staff review before retrying.', {
+                orderId = order.order_id, retryable = restored == true, review = restored ~= true
+            })
+    end
+    if finalBalance < (tonumber(order.amount) or 0) then
+        UpdateFleetOrder(order.order_id, 'payment_failed', {
+            reason = 'insufficient_society_funds_at_debit'
+        }, 'payment_processing')
+        return FleetOrderResult(GetFleetOrderById(order.order_id) or order, false)
+    end
+
+    local debited, debitError = RemoveSocietyFunds(
+        provider,
+        order.account,
+        tonumber(order.amount) or 0,
+        ('drs-fleet-purchase-%s'):format(order.order_id)
+    )
+    if debited == false then
+        UpdateFleetOrder(order.order_id, 'payment_failed', {
+            reason = ('society_debit_rejected:%s'):format(tostring(debitError or 'unknown'))
+        }, 'payment_processing')
+        return FleetOrderResult(GetFleetOrderById(order.order_id) or order, false)
+    elseif debited ~= true then
+        UpdateFleetOrder(order.order_id, 'payment_review', {
+            reason = ('society_debit_result_unknown:%s'):format(tostring(debitError or 'unknown'))
+        }, 'payment_processing')
+        return FleetOrderResult(GetFleetOrderById(order.order_id) or order, false)
+    end
+    if not UpdateFleetOrder(order.order_id, 'debited', { clearReason = true }, 'payment_processing') then
+        UpdateFleetOrder(order.order_id, 'payment_review', {
+            reason = 'society_debit_confirmed_journal_finalize_failed'
+        }, 'payment_processing')
+        return Result(false, 'fleet_payment_review', 'Society funds were debited, but the journal needs staff review.', {
+            orderId = order.order_id, review = true
+        })
+    end
+    return ProcessFleetCreation(GetFleetOrderById(order.order_id), actorSource)
+end
+
+local function ResumeFleetOrder(order, actorSource)
+    if order.status == 'pending' then return ProcessFleetPayment(order, actorSource) end
+    if order.status == 'debited' then
+        return ProcessFleetCreation(order, actorSource)
+    end
+    if order.status == 'creation_review' then
+        if FleetCreationReviewIsRetryable(order) then return ProcessFleetCreation(order, actorSource) end
+    end
+    if order.status == 'refund_due' then return ProcessFleetRefund(order, order.failure_reason) end
+    return FleetOrderResult(order, true)
+end
+
+local function ReconcileFleetOrders()
+    if not FleetOrdersReady then return true end
+    local transitions = {
+        { from = 'pending', to = 'cancelled', reason = 'resource_restart_before_society_debit' },
+        { from = 'payment_processing', to = 'payment_review', reason = 'restart_during_society_debit' },
+        -- Creation is called only after this journal is advanced from debited to
+        -- creation_processing, so a leftover debited row is conclusively safe to refund.
+        { from = 'debited', to = 'refund_due', reason = 'restart_before_fleet_creation' },
+        { from = 'creation_processing', to = 'creation_review', reason = 'restart_during_fleet_creation' },
+        { from = 'refund_processing', to = 'refund_review', reason = 'restart_during_society_refund' }
+    }
+    for _, transition in ipairs(transitions) do
+        local ok, errorMessage = pcall(MySQL.update.await, [[
+            UPDATE drs_vehicle_shop_fleet_orders
+            SET status = ?, failure_reason = ?
+            WHERE status = ?
+        ]], { transition.to, transition.reason, transition.from })
+        if not ok then error(('fleet journal recovery failed: %s'):format(tostring(errorMessage))) end
+    end
+
+    return ProcessDueFleetRefunds()
+end
+
+local function GetFleetCatalogExport(request)
+    local caller = GetAuthorizedFleetCaller()
+    if not caller then return Result(false, 'fleet_caller_denied', 'This resource cannot access fleet checkout.') end
+    if type(request) ~= 'table' then return Result(false, 'invalid_request', 'Invalid fleet catalogue request.') end
+    for key in pairs(request) do
+        if key ~= 'actorSource' and key ~= 'job' then
+            return Result(false, 'invalid_request_field', 'Invalid fleet catalogue request.')
+        end
+    end
+    local actorSource = FleetInteger(request.actorSource, 1, 2147483647)
+    local job = CleanFleetName(request.job, 50)
+    if not actorSource or not job then
+        return Result(false, 'invalid_request', 'Invalid fleet catalogue request.')
+    end
+    local ready, code, message = FleetRuntimeReady(false)
+    if not ready then return Result(false, code, message) end
+
+    local rule = GetFleetCatalogRule(job)
+    if not rule then return Result(false, 'fleet_job_not_configured', 'This job has no fleet purchasing catalogue.') end
+    local minimumGrade = math.max(0, math.floor(tonumber(rule.minimumGrade) or 0))
+    local data, authCode, authMessage = ValidateFleetBoss(actorSource, job, minimumGrade)
+    if not data then return Result(false, authCode, authMessage) end
+    local vehicles, catalogError = BuildFleetCatalog(job)
+    if not vehicles then return Result(false, catalogError, 'The fleet catalogue configuration is invalid.') end
+
+    local unresolved, unresolvedError = GetUnresolvedFleetOrder(job)
+    if unresolvedError then
+        return Result(false, 'fleet_order_guard_unavailable', 'Previous fleet orders could not be checked safely.')
+    end
+    if unresolved then
+        local order, orderError = GetFleetOrderById(unresolved.order_id)
+        if not order then
+            return Result(false, 'fleet_journal_unavailable', 'The unresolved fleet purchase could not be read safely.', {
+                detail = tostring(orderError or 'unknown')
+            })
+        end
+        local actorMatches = order.caller_resource == caller and order.actor_citizenid == data.citizenid
+            and tostring(order.job):lower() == job
+        local recoveryAllowed = order.status == 'pending' or order.status == 'debited'
+            or FleetCreationReviewIsRetryable(order)
+        if actorMatches and recoveryAllowed then
+            local modelAvailable = false
+            for _, item in ipairs(vehicles) do
+                if item.model == tostring(order.model):lower() then modelAvailable = true break end
+            end
+            if not modelAvailable then
+                return Result(false, 'fleet_recovery_model_unavailable',
+                    'The paid fleet order needs staff review because its model is no longer allowlisted.', {
+                        orderId = order.order_id, requestId = order.request_id,
+                        status = order.status, review = true
+                    })
+            end
+
+            local recoveryProvider = ResolveFleetBankProvider(order.bank_provider)
+            local recoveryBalance = recoveryProvider and GetSocietyBalance(recoveryProvider, order.account) or nil
+            return Result(true, 'fleet_catalog_recovery',
+                order.status == 'pending'
+                    and 'An interrupted fleet order is ready to resume with its original request ID.'
+                    or 'A previously paid fleet order is ready for a safe idempotent retry.', {
+                    job = job,
+                    account = order.account,
+                    bankProvider = order.bank_provider,
+                    balance = recoveryBalance or 0,
+                    balanceUnavailable = recoveryBalance == nil,
+                    vehicles = vehicles,
+                    recovery = {
+                        requestId = order.request_id,
+                        model = tostring(order.model):lower(),
+                        garageIndex = tonumber(order.garage_index),
+                        status = order.status,
+                        retryable = true
+                    }
+                })
+        end
+
+        return Result(false, 'fleet_unresolved_order',
+            'This job already has a fleet purchase awaiting completion or staff review.', {
+                orderId = order.order_id,
+                requestId = order.request_id,
+                status = order.status,
+                review = order.status == 'payment_review' or order.status == 'creation_review'
+                    or order.status == 'refund_review'
+            })
+    end
+
+    if #vehicles == 0 then
+        return Result(false, 'fleet_catalog_empty', 'No vehicles are configured for this job fleet.')
+    end
+    local provider = ResolveFleetBankProvider()
+    if not provider then
+        return Result(false, 'fleet_bank_unavailable', 'No supported society banking provider is available.')
+    end
+    local account = CleanFleetName(rule.account or job, 64)
+    if not account then return Result(false, 'fleet_account_invalid', 'This job has an invalid society account configuration.') end
+    local balance, balanceError = GetSocietyBalance(provider, account)
+    if balance == nil then
+        return Result(false, 'fleet_bank_unavailable', 'The society balance could not be verified.', {
+            detail = tostring(balanceError or 'unknown')
+        })
+    end
+    return Result(true, 'fleet_catalog', 'Fleet catalogue ready.', {
+        job = job,
+        account = account,
+        bankProvider = provider,
+        balance = balance,
+        vehicles = vehicles
+    })
+end
+
+local function PurchaseFleetVehicleExport(request)
+    local caller = GetAuthorizedFleetCaller()
+    if not caller then return Result(false, 'fleet_caller_denied', 'This resource cannot access fleet checkout.') end
+    local normalized, requestError = NormalizeFleetPurchaseRequest(request)
+    if not normalized then return Result(false, requestError, 'Invalid society fleet purchase request.') end
+    local fleet = GetFleetConfig()
+    if fleet.Enabled ~= true then return Result(false, 'fleet_disabled', 'Society fleet checkout is disabled.') end
+    if not FleetServiceReady then
+        return Result(false, 'fleet_service_unavailable', 'Society fleet checkout is still starting or needs database attention.')
+    end
+    if GetFramework() ~= 'qbox' then
+        return Result(false, 'fleet_framework_unsupported', 'Paid society fleet purchases currently require Qbox.')
+    end
+
+    local initialData, authCode, authMessage = ValidateFleetBoss(normalized.actorSource, normalized.job, 0)
+    if not initialData then return Result(false, authCode, authMessage) end
+    local existing, existingError = GetFleetOrderByRequest(normalized.requestId)
+    if existingError then
+        return Result(false, 'fleet_journal_unavailable', 'The fleet purchase journal could not be read safely.')
+    end
+    if existing and not FleetOrderMatchesRequest(existing, caller, initialData, normalized) then
+        return Result(false, 'fleet_request_conflict', 'This request id belongs to a different fleet purchase.')
+    end
+
+    if FleetRequestOperations[normalized.requestId] or FleetJobOperations[normalized.job] then
+        return Result(false, 'fleet_purchase_processing', 'A fleet purchase for this job is already being processed.', {
+            requestId = normalized.requestId, retryable = true
+        })
+    end
+
+    if not existing then
+        local now = GetGameTimer()
+        local cooldown = math.max(0, math.floor(tonumber(fleet.PurchaseCooldown) or 2500))
+        local last = FleetPurchaseCooldowns[normalized.actorSource]
+        if last and now - last < cooldown then
+            return Result(false, 'fleet_purchase_cooldown', 'Please wait a moment before another fleet purchase.', {
+                retryable = true
+            })
+        end
+        FleetPurchaseCooldowns[normalized.actorSource] = now
+    end
+
+    FleetRequestOperations[normalized.requestId] = true
+    FleetJobOperations[normalized.job] = normalized.requestId
+    local ok, result = xpcall(function()
+        if existing then
+            local data, existingAuthCode, existingAuthMessage = ValidateFleetBoss(
+                normalized.actorSource, normalized.job, existing.minimum_grade
+            )
+            if not data or data.citizenid ~= existing.actor_citizenid then
+                return Result(false, existingAuthCode or 'fleet_actor_changed',
+                    existingAuthMessage or 'The original fleet purchaser is no longer authorized.')
+            end
+            return ResumeFleetOrder(existing, normalized.actorSource)
+        end
+
+        local ready, runtimeCode, runtimeMessage, provider = FleetRuntimeReady(true)
+        if not ready then return Result(false, runtimeCode, runtimeMessage) end
+        local resolved, resolveCode, rule = ResolveFleetCatalogVehicle(normalized.job, normalized.model)
+        if not resolved then
+            return Result(false, resolveCode, 'This vehicle is not available to the current job fleet.')
+        end
+        local minimumGrade = math.max(0, math.floor(tonumber(rule.minimumGrade) or 0))
+        local data, newAuthCode, newAuthMessage = ValidateFleetBoss(
+            normalized.actorSource, normalized.job, minimumGrade
+        )
+        if not data or data.citizenid ~= initialData.citizenid then
+            return Result(false, newAuthCode or 'fleet_actor_changed',
+                newAuthMessage or 'The acting player changed before the purchase began.')
+        end
+        local account = CleanFleetName(rule.account or normalized.job, 64)
+        if not account then
+            return Result(false, 'fleet_account_invalid', 'This job has an invalid society account configuration.')
+        end
+        local balance = GetSocietyBalance(provider, account)
+        if balance == nil then
+            return Result(false, 'fleet_bank_unavailable', 'The society balance could not be verified.')
+        end
+        if balance < resolved.price then
+            return Result(false, 'fleet_insufficient_funds', 'The society account cannot afford this vehicle.', {
+                amount = resolved.price, balance = balance
+            })
+        end
+
+        local unresolved, guardError = GetUnresolvedFleetOrder(normalized.job)
+        if guardError then
+            return Result(false, 'fleet_order_guard_unavailable', 'Previous fleet orders could not be checked safely.')
+        elseif unresolved then
+            return Result(false, 'fleet_unresolved_order', 'This job already has a fleet purchase awaiting completion or review.', {
+                orderId = unresolved.order_id, status = unresolved.status
+            })
+        end
+
+        local order, createError = CreateFleetOrder(
+            caller, data, normalized, resolved, rule, provider, account
+        )
+        if not order then
+            return Result(false, 'fleet_journal_unavailable', 'The fleet purchase could not be journaled safely.', {
+                detail = tostring(createError or 'unknown')
+            })
+        end
+        if not FleetOrderMatchesRequest(order, caller, data, normalized) then
+            return Result(false, 'fleet_request_conflict', 'This request id belongs to a different fleet purchase.')
+        end
+        return ResumeFleetOrder(order, normalized.actorSource)
+    end, debug.traceback)
+    FleetRequestOperations[normalized.requestId] = nil
+    if FleetJobOperations[normalized.job] == normalized.requestId then FleetJobOperations[normalized.job] = nil end
+
+    if not ok then
+        print(('[drs_vehicleshop] Fleet purchase request %s failed: %s'):format(
+            normalized.requestId, tostring(result)
+        ))
+        local order = GetFleetOrderByRequest(normalized.requestId)
+        if order then
+            if order.status == 'payment_processing' then
+                UpdateFleetOrder(order.order_id, 'payment_review', { reason = 'fleet_purchase_exception_during_debit' }, 'payment_processing')
+            elseif order.status == 'creation_processing' then
+                UpdateFleetOrder(order.order_id, 'creation_review', { reason = 'fleet_purchase_exception_during_creation' }, 'creation_processing')
+            elseif order.status == 'refund_processing' then
+                UpdateFleetOrder(order.order_id, 'refund_review', { reason = 'fleet_purchase_exception_during_refund' }, 'refund_processing')
+            end
+        end
+        return Result(false, 'fleet_internal_error', 'The fleet purchase stopped safely and may need staff review.', {
+            requestId = normalized.requestId, review = order ~= nil
+        })
+    end
+    return result
+end
+
+local function GetFleetServiceStatusExport()
+    local caller = GetAuthorizedFleetCaller()
+    if not caller then
+        return Result(false, 'fleet_caller_denied', 'This resource cannot inspect fleet checkout.')
+    end
+
+    local fleet = GetFleetConfig()
+    local ready, code, message, provider, garageResource = FleetRuntimeReady(true)
+    local statusQueryOk = false
+    local statusQueryDetail = FleetOrdersReady and 'fleet order status query has not completed'
+        or 'fleet order journal is not ready'
+    local reviewOrders, unresolvedOrders = 0, 0
+
+    if FleetOrdersReady then
+        local queryOk, counts = pcall(MySQL.single.await, [[
+            SELECT
+                COALESCE(SUM(CASE WHEN `status` IN ('payment_review', 'creation_review', 'refund_review') THEN 1 ELSE 0 END), 0) AS `review_orders`,
+                COALESCE(SUM(CASE WHEN `status` NOT IN ('stored', 'refunded', 'cancelled', 'payment_failed') THEN 1 ELSE 0 END), 0) AS `unresolved_orders`
+            FROM `drs_vehicle_shop_fleet_orders`
+        ]])
+        if queryOk and type(counts) == 'table'
+            and tonumber(counts.review_orders) and tonumber(counts.unresolved_orders)
+        then
+            statusQueryOk = true
+            reviewOrders = math.max(0, math.floor(tonumber(counts.review_orders)))
+            unresolvedOrders = math.max(0, math.floor(tonumber(counts.unresolved_orders)))
+            statusQueryDetail = ('%d unresolved fleet order(s), %d requiring review'):format(
+                unresolvedOrders,
+                reviewOrders
+            )
+        else
+            statusQueryDetail = queryOk and 'fleet order status query returned invalid data'
+                or ('fleet order status query failed: %s'):format(tostring(counts))
+        end
+    end
+
+    if ready and not statusQueryOk then
+        ready = false
+        code = 'fleet_journal_status_unavailable'
+        message = statusQueryDetail
+    end
+
+    return {
+        ok = ready == true,
+        ready = ready == true,
+        enabled = fleet.Enabled == true,
+        code = code,
+        message = message,
+        detail = message,
+        bankProvider = provider,
+        garageResource = garageResource,
+        journalReady = FleetOrdersReady == true,
+        statusQueryOk = statusQueryOk,
+        statusQueryDetail = statusQueryDetail,
+        reviewOrders = reviewOrders,
+        unresolvedOrders = unresolvedOrders,
+        bankMutationDurable = provider == 'qb-banking',
+        bankDurabilityDetail = provider == 'qb-banking'
+            and 'QB Banking awaits and returns the affected-row result for society balance mutations.'
+            or provider == 'renewed-banking'
+                and 'Renewed Banking acknowledges before its asynchronous balance update is durably confirmed.'
+                or 'No supported bank provider is active.'
+    }
+end
+
+exports('GetFleetCatalog', GetFleetCatalogExport)
+exports('PurchaseFleetVehicle', PurchaseFleetVehicleExport)
+exports('GetFleetServiceStatus', GetFleetServiceStatusExport)
+
 lib.callback.register('drs_vehicleshop:server:quoteVehicle', QuoteVehicle)
 lib.callback.register('drs_vehicleshop:server:purchaseVehicle', PurchaseVehicle)
 lib.callback.register('drs_vehicleshop:server:acknowledgeDelivery', AcknowledgeDelivery)
@@ -3696,6 +5007,7 @@ AddEventHandler('playerDropped', function()
     if Operations[src] then Operations[src].dropped = true end
     TestDriveCooldowns[src] = nil
     PurchaseCooldowns[src] = nil
+    FleetPurchaseCooldowns[src] = nil
     CheckoutQuoteCooldowns[src] = nil
     local quoteId = CheckoutQuoteBySource[src]
     local quote = quoteId and CheckoutQuotes[quoteId]
@@ -3815,6 +5127,32 @@ CreateThread(function()
     ServiceReady = true
     print(('[drs_vehicleshop] Secure purchase service ready using %s.'):format(GetFramework()))
 
+    if GetFleetConfig().Enabled == true then
+        if GetFramework() ~= 'qbox' then
+            print('[drs_vehicleshop] Society fleet checkout disabled: the Qbox ownership path is required. Personal purchases remain available.')
+        else
+            local fleetInitialized, fleetReady, fleetCode = xpcall(EnsureFleetOrderTable, debug.traceback)
+            if fleetInitialized and fleetReady then
+                local fleetReconciled, fleetReconcileError = xpcall(ReconcileFleetOrders, debug.traceback)
+                if fleetReconciled then
+                    FleetServiceReady = true
+                    print('[drs_vehicleshop] Durable society fleet checkout journal ready (runtime providers are verified per request).')
+                else
+                    print(('[drs_vehicleshop] Society fleet checkout disabled because recovery failed: %s. Personal purchases remain available.'):format(
+                        tostring(fleetReconcileError)
+                    ))
+                end
+            else
+                if not fleetInitialized then fleetCode = fleetReady end
+                print(('[drs_vehicleshop] Society fleet checkout disabled: %s. Personal purchases remain available.'):format(
+                    tostring(fleetCode)
+                ))
+            end
+        end
+    else
+        print('[drs_vehicleshop] Society fleet checkout disabled by configuration.')
+    end
+
     while true do
         Wait(30000)
         local now = os.time()
@@ -3833,6 +5171,12 @@ CreateThread(function()
         end
         for _, playerId in ipairs(GetPlayers()) do
             ProcessRefunds(tonumber(playerId))
+        end
+        if FleetServiceReady then
+            local refundsOk, refundsError = xpcall(ProcessDueFleetRefunds, debug.traceback)
+            if not refundsOk then
+                print(('[drs_vehicleshop] Automatic society refund retry failed: %s'):format(tostring(refundsError)))
+            end
         end
     end
 end)

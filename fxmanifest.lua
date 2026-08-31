@@ -4,7 +4,7 @@ lua54 'yes'
 
 author 'DRS; based on QR Development qr-vehicleshop'
 description 'DRS Vehicle Shop - secure multi-framework vehicle dealership system'
-version '1.0.1-drs.6'
+version '1.0.1-drs.8'
 
 shared_scripts {
     '@ox_lib/init.lua',

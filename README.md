@@ -77,6 +77,85 @@ resources can use it to obtain the configured vehicle name, brand, and ordered i
 candidates without copying this resource's vehicle artwork. The export is presentation
 only and does not grant access to purchase or ownership actions.
 
+## Society fleet checkout
+
+Version `1.0.1-drs.7` adds an opt-in-by-job, Qbox-first society purchase service for
+the DRS Garages fleet manager. `Config.Fleet.Enabled` is true in the supplied
+configuration, but every request fails closed unless all of the following are true:
+
+- the framework resolves to Qbox;
+- the fleet journal migrated and reconciled successfully;
+- `drs_garages` (or the explicitly configured replacement) is started and its
+  fleet journal reports ready through `GetJobFleetServiceStatus`;
+- Renewed Banking or QB Banking resolves through `Config.Fleet.BankProvider`;
+- the caller resource is present in `Config.Fleet.AllowedCallers`;
+- the acting player still has the exact requested job, is its boss, meets the
+  configured grade, and is on duty when `RequireOnDuty` is enabled; and
+- the requested model is in that exact job's `Config.Fleet.Catalogs` allowlist.
+
+The included `police` and `ambulance` rules deliberately contain only a small stock
+vehicle set. Add add-on models explicitly, or add a category only when every model in
+that category should be purchasable by that job. Prices always come from
+`Config.Vehicles`; the calling resource cannot supply an amount, plate, hash, vehicle
+properties, society account, or banking provider.
+
+The service has no public client callback. The trusted DRS Garages server integration
+uses these exports:
+
+```lua
+local catalog = exports.drs_vehicleshop:GetFleetCatalog({
+    actorSource = source,
+    job = 'police'
+})
+
+local purchase = exports.drs_vehicleshop:PurchaseFleetVehicle({
+    requestId = durableRequestId, -- 8-64 safe characters; reuse it for every retry
+    actorSource = source,
+    action = 'society_purchase',
+    job = 'police',
+    model = 'police3',
+    garageIndex = 1              -- one-based Config.Garages index in drs_garages
+})
+```
+
+`GetFleetCatalog` returns only server-resolved models, display fields, prices, the
+current society balance, and provider. `PurchaseFleetVehicle` journals the immutable
+authority/model/destination fingerprint and its optional audit reason, confirms the
+society debit, and then calls DRS Garages'
+idempotent `CreateJobFleetVehicle` export. A committed result is authoritative even
+when the garage also reports that one of its final journal writes needs review.
+
+After a restart or an uncertain garage response, the catalogue may include
+`recovery = { requestId, model, garageIndex, status, retryable = true }`. This covers
+an interrupted pre-debit order, a confirmed debit awaiting creation, and retryable
+creation-review states. DRS Garages binds the new server-side purchase session to that
+original request and model, allowing the creation export to replay without charging
+the society a second time. A recovery catalogue for an already-debited order remains
+available even if the original banking provider is temporarily down.
+
+`GetFleetServiceStatus` is available to allowlisted callers so DRS Garages Doctor can
+verify the fleet journal, garage creation bridge, and society banking provider instead
+of treating a merely started shop resource as a healthy paid-checkout service. It also
+reports unresolved/review order counts and whether the selected bank durably
+acknowledges society balance mutations. Idempotency binds the stable Qbox `citizenid`,
+so the same authorized boss can resume a journaled request after reconnecting with a
+different ephemeral server ID without a second society debit.
+
+`auto` prefers `qb-banking` when it is available because its current balance-mutation
+exports return oxmysql's awaited affected-row result. Renewed-Banking is supported for
+Qbox servers, but its current exports return success before their asynchronous database
+update is durably confirmed; Doctor reports that provider as a best-effort warning.
+
+The separate `drs_vehicle_shop_fleet_orders` journal prevents ownerless job purchases
+from entering the personal-purchase recovery path, which assumes a player
+`citizenid`. A crash during a society debit becomes `payment_review`; a confirmed
+debit recorded before creation can be safely refunded; a crash while the garage export
+is running becomes `creation_review` and is replayed with the same request id; and a
+crash during a refund becomes `refund_review`. Never manually refund a review-state
+order without checking the banking history and the matching DRS Garages fleet
+operation first. Admin grants do not use this paid service and remain protected by the
+DRS Garages ACE policy.
+
 ## Database
 
 Database setup is automatic. On startup, the resource waits for oxmysql and then:
@@ -85,6 +164,7 @@ Database setup is automatic. On startup, the resource waits for oxmysql and then
 - adds missing Qbox/QB garage compatibility columns without rebuilding the table;
 - renames the completed QR build's journal tables and named indexes to the DRS names;
 - creates or upgrades the purchase journal and plate-reservation table;
+- creates and verifies the separate durable society fleet-purchase journal;
 - aligns both purchase-journal tables to the charset/collation used by
   `player_vehicles.plate`;
 - verifies the required InnoDB engines, indexes, and global plate uniqueness; and
@@ -204,15 +284,22 @@ Vanilla/add-on classification was checked against the current Cfx.re Vehicle Mod
 reference and current dumped game metadata, including official DLC models omitted
 from the documentation index.
 
-Emergency and service categories are not exposed by the default public auto shop.
-When enabling them, also configure server-enforced group/grade rules:
+Version `1.0.1-drs.8` exposes the emergency catalogue in the public auto shop. The server
+allows only members of the exact `police` group at grade 0 or higher to quote, purchase,
+or test drive those vehicles:
 
 ```lua
 Config.CategoryAccess = {
-    emergency = { groups = { police = 0, ambulance = 0 } },
-    service = { groups = { mechanic = 0, taxi = 0 } }
+    emergency = { groups = { police = 0 } }
 }
 ```
+
+Category visibility is controlled separately by each shop's `categories` list, so other
+players can browse the emergency catalogue but receive a server authorization error if
+they attempt a protected action. These are personal purchases; department-owned society
+fleet purchases continue through the protected DRS Garages integration described above.
+The service category remains unexposed until it is added to a shop and given an access
+rule appropriate for that server.
 
 ## Vehicle imagery
 
@@ -285,9 +372,10 @@ rows, so a garage-only restart does not blanket-mark still-live vehicles stored.
 For deployment, back up the database and restart the resources in the order above.
 DRS Vehicle Shop applies and verifies its migration before accepting quotes or purchases.
 Only servers whose oxmysql account lacks schema-alter privileges need the manual SQL fallback.
-Review any `payment_review`, `refund_review`, `ownership_review`, or `delivery_review`
-rows and corresponding server log entries before allowing the same player to retry an
-affected purchase.
+Review any personal `payment_review`, `refund_review`, `ownership_review`, or
+`delivery_review` rows and any fleet `payment_review`, `creation_review`, or
+`refund_review` rows with the corresponding server logs before changing journal state
+or issuing money manually.
 
 ## Attribution and license
 

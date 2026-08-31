@@ -76,3 +76,38 @@ CREATE TABLE IF NOT EXISTS drs_vehicle_shop_plate_reservations (
     UNIQUE KEY uk_drs_vehicle_shop_reservation_request (request_id),
     UNIQUE KEY uk_drs_vehicle_shop_reservation_order (order_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Paid society fleet purchases use a separate journal because their payer is a
+-- job account while the resulting player_vehicles row is ownerless and belongs
+-- to `job`. Mixing these records into the personal-purchase recovery queries
+-- would make refund and ownership reconciliation unsafe.
+CREATE TABLE IF NOT EXISTS drs_vehicle_shop_fleet_orders (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    order_id VARCHAR(64) NOT NULL,
+    request_id VARCHAR(96) NOT NULL,
+    caller_resource VARCHAR(64) NOT NULL,
+    actor_citizenid VARCHAR(50) NOT NULL,
+    actor_license VARCHAR(80) NULL,
+    job VARCHAR(50) NOT NULL,
+    model VARCHAR(64) NOT NULL,
+    vehicle_type VARCHAR(20) NOT NULL,
+    garage_index INT UNSIGNED NOT NULL,
+    minimum_grade INT UNSIGNED NOT NULL DEFAULT 0,
+    account VARCHAR(64) NOT NULL,
+    bank_provider VARCHAR(32) NOT NULL,
+    amount INT UNSIGNED NOT NULL,
+    purchase_reason VARCHAR(160) NULL,
+    status VARCHAR(32) NOT NULL,
+    vehicle_id BIGINT NULL,
+    plate VARCHAR(15) NULL,
+    garage_operation_id VARCHAR(96) NULL,
+    failure_reason VARCHAR(255) NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_drs_vehicle_shop_fleet_order_id (order_id),
+    UNIQUE KEY uk_drs_vehicle_shop_fleet_request_id (request_id),
+    KEY idx_drs_vehicle_shop_fleet_job_status (job, status),
+    KEY idx_drs_vehicle_shop_fleet_actor_status (actor_citizenid, status),
+    KEY idx_drs_vehicle_shop_fleet_plate (plate)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
